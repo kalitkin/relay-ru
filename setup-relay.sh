@@ -119,7 +119,14 @@ install_xray() {
     trap "rm -rf '$tmp'" RETURN
 
     curl -fsSL "$url" -o "$tmp/xray.zip"
-    unzip -q "$tmp/xray.zip" -d "$tmp/xray"
+    mkdir -p "$tmp/xray"
+    if command -v unzip &>/dev/null; then
+        unzip -q "$tmp/xray.zip" -d "$tmp/xray"
+    elif command -v python3 &>/dev/null; then
+        python3 -c "import zipfile; zipfile.ZipFile('$tmp/xray.zip').extractall('$tmp/xray')"
+    else
+        die "Нет ни unzip ни python3 для распаковки. Установи: apt-get install unzip"
+    fi
     install -m 755 "$tmp/xray/xray" "$XRAY_BIN"
 
     mkdir -p "$XRAY_CONF_DIR" "$XRAY_LOG_DIR"
@@ -664,8 +671,11 @@ main() {
 
     info "ОС: $(lsb_release -ds 2>/dev/null || uname -rs)"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq 2>&1 | grep -v "^$" || true
-    apt-get install -y -qq curl unzip jq ufw iptables-persistent 2>&1 | grep -E "^(E:|Err:)" || true
+    apt-get update -qq 2>/dev/null || true
+    apt-get -f install -y -qq 2>/dev/null || true
+    for pkg in curl unzip jq ufw iptables-persistent; do
+        apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не удалось установить $pkg — продолжаю"
+    done
 
     install_xray
     healthcheck_upstream
