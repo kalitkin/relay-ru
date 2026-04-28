@@ -329,7 +329,7 @@ $out2,
 }
 EOF
 
-    "$XRAY_BIN" run -test -config "$XRAY_CONF" &>/dev/null || die "Конфиг не прошёл валидацию xray"
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 || die "Конфиг не прошёл валидацию xray"
     ok "Конфиг записан: $XRAY_CONF"
 
     # Сохраняем состояние (pub info только — без private key)
