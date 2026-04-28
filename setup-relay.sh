@@ -83,7 +83,7 @@ validate_env() {
 # ══════════════════════════════════════════════════════════════════
 check_deps() {
     local missing=()
-    for cmd in curl jq openssl unzip; do
+    for cmd in curl openssl; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     (( ${#missing[@]} > 0 )) && die "Не хватает команд: ${missing[*]}"
