@@ -130,9 +130,6 @@ install_xray() {
     install -m 755 "$tmp/xray/xray" "$XRAY_BIN"
 
     mkdir -p "$XRAY_CONF_DIR" "$XRAY_LOG_DIR"
-    for f in geoip.dat geosite.dat; do
-        [[ -f "$tmp/xray/$f" ]] && cp "$tmp/xray/$f" "$XRAY_CONF_DIR/"
-    done
 
     ok "xray $("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}') установлен"
 }
@@ -300,7 +297,7 @@ $out2,
     "rules": [
       {
         "type": "field",
-        "ip": ["geoip:private"],
+        "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
         "outboundTag": "BLOCK"
       },
       {
