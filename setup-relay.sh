@@ -454,12 +454,11 @@ EOF
 # Firewall + лимит подключений
 # ══════════════════════════════════════════════════════════════════
 setup_security() {
-    info "Настраиваю firewall и ограничение подключений..."
+    info "Настраиваю firewall (iptables)..."
 
-    # UFW
-    ufw allow ssh          > /dev/null
-    ufw allow "$RELAY_PORT/tcp" > /dev/null
-    echo "y" | ufw enable  > /dev/null 2>&1 || true
+    # Разрешаем SSH и relay порт
+    iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null  || iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+    iptables -C INPUT -p tcp --dport "$RELAY_PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$RELAY_PORT" -j ACCEPT
 
     # Лимит соединений на порт relay (per source IP)
     local ipt_rule="-p tcp --dport $RELAY_PORT --syn -m connlimit --connlimit-above $CONN_LIMIT --connlimit-mask 32 -j REJECT --reject-with tcp-reset"
@@ -470,7 +469,7 @@ setup_security() {
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
-    ok "UFW: порт $RELAY_PORT/tcp открыт"
+    ok "iptables: порт $RELAY_PORT/tcp открыт"
     ok "iptables: conn limit $CONN_LIMIT/IP на порту $RELAY_PORT"
 }
 
@@ -670,7 +669,7 @@ main() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq 2>/dev/null || true
     apt-get -f install -y -qq 2>/dev/null || true
-    for pkg in curl unzip jq ufw iptables-persistent; do
+    for pkg in curl unzip jq iptables-persistent; do
         apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не удалось установить $pkg — продолжаю"
     done
 
