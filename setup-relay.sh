@@ -663,10 +663,9 @@ main() {
     check_deps
 
     info "ОС: $(lsb_release -ds 2>/dev/null || uname -rs)"
-    apt-get update -qq
-    apt-get install -y -qq \
-        curl unzip jq ufw iptables-persistent \
-        > /dev/null 2>&1
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq 2>&1 | grep -v "^$" || true
+    apt-get install -y -qq curl unzip jq ufw iptables-persistent 2>&1 | grep -E "^(E:|Err:)" || true
 
     install_xray
     healthcheck_upstream
