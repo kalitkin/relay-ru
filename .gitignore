@@ -1,0 +1,18 @@
+# Реальные env-файлы с секретами — не коммитить
+.env
+*.env.local
+/etc/relay.env
+
+# Оставляем шаблон
+!.env.relay
+
+# Архивы и прочее
+*.zip
+*.txt
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

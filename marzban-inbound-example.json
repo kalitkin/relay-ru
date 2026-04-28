@@ -1,0 +1,81 @@
+{
+  "_comment": "Добавить в Marzban на КАЖДОМ VPS (NL и FI): Xray Settings → inbounds → append",
+
+  "normal_mode": {
+    "_comment": "MODE=normal — relay подключается по VLESS+TLS. Нужен сертификат на VPS.",
+    "_setup": [
+      "Создать сертификат на VPS:",
+      "  mkdir -p /etc/ssl/xray",
+      "  openssl req -x509 -newkey rsa:2048 \\",
+      "    -keyout /etc/ssl/xray/relay.key \\",
+      "    -out /etc/ssl/xray/relay.crt \\",
+      "    -days 3650 -nodes -subj '/CN=relay'",
+      "Потом добавить inbound ниже и перезапустить xray на VPS."
+    ],
+    "inbound": {
+      "tag": "RELAY-RU-<relay_ip>",
+      "listen": "0.0.0.0",
+      "port": 7443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "<UPSTREAM_UUID>",
+            "email": "relay-ru",
+            "encryption": "none"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{
+            "certificateFile": "/etc/ssl/xray/relay.crt",
+            "keyFile":         "/etc/ssl/xray/relay.key"
+          }]
+        }
+      }
+    }
+  },
+
+  "secure_mode": {
+    "_comment": "MODE=secure — relay подключается по VLESS+Reality. Нужна своя Reality-пара.",
+    "_setup": [
+      "Сгенерировать keypair на VPS:",
+      "  xray x25519",
+      "  → Private key → вставить в 'privateKey' ниже",
+      "  → Public key  → вставить как UPSTREAM_PUBLIC_KEY в /etc/relay.env на relay VM",
+      "Потом на relay VM: systemctl restart xray-relay"
+    ],
+    "inbound": {
+      "tag": "RELAY-RU-<relay_ip>",
+      "listen": "0.0.0.0",
+      "port": 7443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "<UPSTREAM_UUID>",
+            "email": "relay-ru",
+            "encryption": "none"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "ya.ru:443",
+          "xver": 0,
+          "serverNames": ["ya.ru"],
+          "privateKey": "<СГЕНЕРИРОВАТЬ НА VPS: xray x25519>",
+          "shortIds": ["<UPSTREAM_SHORT_ID из relay .env>"]
+        }
+      }
+    }
+  }
+}
