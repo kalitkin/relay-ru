@@ -83,7 +83,7 @@ validate_env() {
 # ══════════════════════════════════════════════════════════════════
 check_deps() {
     local missing=()
-    for cmd in curl jq openssl nc; do
+    for cmd in curl jq openssl unzip; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     (( ${#missing[@]} > 0 )) && die "Не хватает команд: ${missing[*]}"
@@ -139,7 +139,7 @@ healthcheck_upstream() {
     for n in 1 2; do
         local ip_var="UPSTREAM_${n}_IP"
         local ip="${!ip_var}"
-        if nc -z -w4 "$ip" "$UPSTREAM_PORT" 2>/dev/null; then
+        if (echo >/dev/tcp/"$ip"/"$UPSTREAM_PORT") 2>/dev/null; then
             ok "Upstream $n  ($ip:$UPSTREAM_PORT) — доступен"
             (( reachable++ ))
         else
@@ -388,7 +388,7 @@ PORT=$(jq -r .upstream_port "$STATE")
 RPORT=$(jq -r .relay_port   "$STATE")
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 
-tcp_check() { nc -z -w3 "$1" "$2" 2>/dev/null && echo "UP" || echo "DOWN"; }
+tcp_check() { (echo >/dev/tcp/"$1"/"$2") 2>/dev/null && echo "UP" || echo "DOWN"; }
 
 SVC=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
 PORT_OK=$(ss -tlnp | grep -q ":$RPORT " && echo "LISTEN" || echo "CLOSED")
@@ -486,28 +486,34 @@ setup_bbr() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Проверка IP в белых списках RU-сегмента
+# Проверка IP в белых списках RU-сегмента (pure bash, без python)
 # ══════════════════════════════════════════════════════════════════
+_ip_to_int() {
+    local a b c d; IFS='.' read -r a b c d <<< "$1"
+    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+_in_cidr() {
+    local net=${2%/*} pfx=${2#*/}
+    local ip_int net_int mask
+    ip_int=$(_ip_to_int "$1")
+    net_int=$(_ip_to_int "$net")
+    mask=$(( (0xFFFFFFFF << (32 - pfx)) & 0xFFFFFFFF ))
+    return $(( (ip_int & mask) != (net_int & mask) ))
+}
+
 check_whitelist_ip() {
     local ip=$1
-    # CIDR-диапазоны облаков, которые попадают в белые списки операторов
     local -a ranges=(
-        "84.201.0.0/16"    "84.252.128.0/17"  "130.193.32.0/19"  # Yandex Cloud
-        "158.160.0.0/16"   "51.250.0.0/16"    "89.249.160.0/21"  # Yandex Cloud
-        "62.84.112.0/20"   "178.154.128.0/17" "93.158.128.0/18"  # Yandex Cloud
-        "94.100.0.0/16"    "217.69.128.0/17"  "195.239.160.0/20" # Mail.ru / VK
-        "185.30.176.0/22"  "194.67.0.0/16"                       # Mail.ru / VK
-        "185.231.204.0/22" "185.233.116.0/22"                    # Aeza RU
+        "84.201.0.0/16"    "84.252.128.0/17"  "130.193.32.0/19"
+        "158.160.0.0/16"   "51.250.0.0/16"    "89.249.160.0/21"
+        "62.84.112.0/20"   "178.154.128.0/17" "93.158.128.0/18"
+        "94.100.0.0/16"    "217.69.128.0/17"  "195.239.160.0/20"
+        "185.30.176.0/22"  "194.67.0.0/16"
+        "185.231.204.0/22" "185.233.116.0/22"
     )
     for cidr in "${ranges[@]}"; do
-        if python3 -c "
-import ipaddress, sys
-try:
-    if ipaddress.ip_address('$ip') in ipaddress.ip_network('$cidr'):
-        sys.exit(0)
-except:
-    pass
-sys.exit(1)" 2>/dev/null; then
+        if _in_cidr "$ip" "$cidr"; then
             echo "$cidr"
             return
         fi
@@ -659,7 +665,7 @@ main() {
     info "ОС: $(lsb_release -ds 2>/dev/null || uname -rs)"
     apt-get update -qq
     apt-get install -y -qq \
-        curl wget unzip jq ufw netcat-openbsd iptables-persistent python3 \
+        curl unzip jq ufw iptables-persistent \
         > /dev/null 2>&1
 
     install_xray
