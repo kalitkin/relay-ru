@@ -163,9 +163,14 @@ check_asn() {
     local wl="${KNOWN_WL[$ASN_NUM]:-}"
     if [[ -n "$wl" ]]; then
         pass "ASN $ASN_NUM → $wl (есть в белых списках операторов)"
+    elif [[ "$CC" == "RU" ]]; then
+        # Страна RU, но ASN не в списке — может быть небольшой RU-провайдер
+        warn_only "ASN $ASN_NUM (${ISP:-?}) — не в известном списке, но страна RU"
+        warn_msg  "    Попробуй, но надёжнее: Yandex Cloud / Aeza / VK Cloud"
     else
-        warn_only "ASN $ASN_NUM (${ISP:-?}) — не найден в известном списке"
-        warn_msg  "    Нужен: Yandex Cloud / Aeza / VK Cloud / Selectel / Timeweb"
+        # Страна не RU И ASN не в списке — точно не подойдёт
+        flunk "ASN $ASN_NUM (${ISP:-?}) — не RU-облако, белые списки операторов не пройдёт"
+        fail_msg "    Нужен: Yandex Cloud / Aeza / VK Cloud / Selectel / Timeweb"
     fi
 }
 
