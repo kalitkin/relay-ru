@@ -35,6 +35,42 @@ hr()   { echo -e "${CC}$(printf '─%.0s' {1..60})${NC}"; }
 # ══════════════════════════════════════════════════════════════════
 urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
 
+# Раскрывает аргумент в массив VLESS-ссылок:
+# - "vless://..."           → как есть
+# - "http(s)://.../sub/..." → скачивает, base64-декодит при необходимости, режет по строкам
+# Результат пишет в EXPANDED_LINKS (глобальный массив).
+expand_arg() {
+    local arg=$1
+    if [[ "$arg" =~ ^vless:// ]]; then
+        EXPANDED_LINKS+=("$arg")
+        return
+    fi
+    if [[ "$arg" =~ ^https?:// ]]; then
+        info "Скачиваю подписку: $arg"
+        local body
+        body=$(curl -fsSL --max-time 10 -A "v2rayNG/1.8.0" "$arg") \
+            || die "Не удалось скачать подписку: $arg"
+        # base64?
+        if ! grep -q "vless://" <<< "$body"; then
+            local decoded
+            decoded=$(echo "$body" | base64 -d 2>/dev/null || true)
+            grep -q "vless://" <<< "$decoded" \
+                && body="$decoded" \
+                || die "В подписке нет VLESS-ссылок (формат не распознан)"
+        fi
+        local count=0
+        while IFS= read -r line; do
+            [[ "$line" =~ ^vless:// ]] || continue
+            EXPANDED_LINKS+=("$line")
+            ((count++))
+        done <<< "$body"
+        (( count == 0 )) && die "Из подписки не извлечено ни одной VLESS-ссылки"
+        ok "Из подписки получено $count VLESS-ссылок"
+        return
+    fi
+    die "Аргумент не VLESS и не URL подписки: $arg"
+}
+
 parse_vless() {
     local idx=$1 link=$2
     [[ "$link" =~ ^vless://(.+)$ ]] || die "Не VLESS-ссылка: $link"
@@ -454,24 +490,40 @@ main() {
 
     [[ $# -eq 0 ]] && cat <<USAGE && exit 1
 Использование:
-  sudo bash $0 "vless://..."                  # один upstream
-  sudo bash $0 "vless://...NL" "vless://...FI" # с failover
-  sudo bash $0 --uninstall                    # снести relay
+  sudo bash $0 "vless://..."                       # одна VLESS-ссылка
+  sudo bash $0 "vless://NL" "vless://FI"           # с failover
+  sudo bash $0 "https://.../sub/..."               # подписка (Marzban subscription URL)
+  sudo bash $0 --uninstall                         # снести relay
 
 ENV (необязательно):
-  RELAY_PORT=443         — порт куда подключается клиент
+  RELAY_PORT=443           — порт куда подключается клиент
   RELAY_SNI=cloudflare.com — SNI для Reality на relay
-  RELAY_UUID=<uuid>      — фиксированный UUID клиента
-  CONN_LIMIT=64          — лимит соединений с одного IP
+  RELAY_UUID=<uuid>        — фиксированный UUID клиента
+  CONN_LIMIT=64            — лимит соединений с одного IP
 USAGE
 
     RELAY_PORT="${RELAY_PORT:-443}"
     RELAY_SNI="${RELAY_SNI:-${SNI_POOL[$((RANDOM % ${#SNI_POOL[@]}))]}}"
     CONN_LIMIT="${CONN_LIMIT:-64}"
 
-    UPCOUNT=$#
+    info "OS: $(lsb_release -ds 2>/dev/null || uname -rs)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq 2>/dev/null || true
+    for pkg in curl jq iptables-persistent; do
+        command -v "${pkg%%-*}" &>/dev/null && continue
+        apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не поставил $pkg"
+    done
+
+    EXPANDED_LINKS=()
+    for arg in "$@"; do
+        expand_arg "$arg"
+    done
+
+    UPCOUNT=${#EXPANDED_LINKS[@]}
+    (( UPCOUNT == 0 )) && die "Не получено ни одной VLESS-ссылки"
+
     local i=1
-    for link in "$@"; do
+    for link in "${EXPANDED_LINKS[@]}"; do
         parse_vless "$i" "$link"
         local h p n
         eval "h=\$UP${i}_HOST"; eval "p=\$UP${i}_PORT"; eval "n=\$UP${i}_NAME"
@@ -481,14 +533,6 @@ USAGE
             warn "Upstream #$i ${n:-} → $h:$p — недоступен (relay поднимется, но трафик не пройдёт)"
         fi
         ((i++))
-    done
-
-    info "OS: $(lsb_release -ds 2>/dev/null || uname -rs)"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq 2>/dev/null || true
-    for pkg in curl jq iptables-persistent; do
-        command -v "${pkg%%-*}" &>/dev/null && continue
-        apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не поставил $pkg"
     done
 
     install_xray
