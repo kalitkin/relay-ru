@@ -1,33 +1,27 @@
 #!/usr/bin/env bash
-# setup-relay.sh — Production-lite Xray relay (RU segment → NL/FI VPS)
+# setup-relay.sh v2 — Lightweight RU-relay через существующий VLESS+Reality
 #
 # Схема:
-#   Client → VLESS+Reality → [этот relay] → VLESS+TLS|Reality → VPS (NL / FI)
+#   Клиент → VLESS+Reality → [этот relay (RU)] → VLESS+Reality → твой VPS:8443 → инет
+#
+# На VPS НИЧЕГО менять не надо — relay подключается к существующему inbound
+# (тому же что использует обычный клиент).
 #
 # Использование:
-#   cp .env.relay /etc/relay.env && nano /etc/relay.env
-#   sudo bash setup-relay.sh
-#
-# Или через env-переменные:
-#   UUID=xxx UPSTREAM_UUID=yyy UPSTREAM_1_IP=1.2.3.4 UPSTREAM_2_IP=5.6.7.8 sudo bash setup-relay.sh
+#   sudo bash setup-relay.sh "vless://UUID@HOST:8443?security=reality&sni=...&pbk=...&sid=...&fp=chrome&flow=xtls-rprx-vision&type=tcp#NL"
+#   sudo bash setup-relay.sh "vless://...NL" "vless://...FI"        # с failover
+#   sudo RELAY_PORT=8443 bash setup-relay.sh "vless://..."          # порт relay
 
 set -euo pipefail
 
-# ══════════════════════════════════════════════════════════════════
-# Константы
-# ══════════════════════════════════════════════════════════════════
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly XRAY_CONF_DIR="/usr/local/etc/xray"
 readonly XRAY_CONF="$XRAY_CONF_DIR/config.json"
 readonly XRAY_LOG_DIR="/var/log/xray"
 readonly STATE_FILE="/etc/relay-state.json"
-readonly ENV_FILE="${ENV_FILE:-/etc/relay.env}"
 readonly XRAY_VERSION="${XRAY_VERSION:-25.3.6}"
 readonly -a SNI_POOL=("ya.ru" "cloudflare.com" "microsoft.com")
 
-# ══════════════════════════════════════════════════════════════════
-# Вывод
-# ══════════════════════════════════════════════════════════════════
 CR='\033[0;31m'; CG='\033[0;32m'; CY='\033[1;33m'
 CC='\033[0;36m'; CB='\033[1m'; NC='\033[0m'
 info() { echo -e "${CC}[•]${NC} $*"; }
@@ -37,74 +31,78 @@ die()  { echo -e "${CR}[✗]${NC} $*" >&2; exit 1; }
 hr()   { echo -e "${CC}$(printf '─%.0s' {1..60})${NC}"; }
 
 # ══════════════════════════════════════════════════════════════════
-# Валидация env
+# Парсер VLESS-ссылки → переменные UPi_*
 # ══════════════════════════════════════════════════════════════════
-validate_env() {
-    [[ $EUID -ne 0 ]] && die "Нужен root: sudo bash $0"
+urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
 
-    # Загружаем .env если есть
-    if [[ -f "$ENV_FILE" ]]; then
-        info "Загружаю $ENV_FILE"
-        set -a; source "$ENV_FILE"; set +a
+parse_vless() {
+    local idx=$1 link=$2
+    [[ "$link" =~ ^vless://(.+)$ ]] || die "Не VLESS-ссылка: $link"
+    local rest="${BASH_REMATCH[1]}"
+
+    local frag=""
+    if [[ "$rest" == *"#"* ]]; then
+        frag=$(urldecode "${rest##*#}")
+        rest="${rest%%#*}"
     fi
 
-    # Применяем дефолты
-    MODE="${MODE:-normal}"
-    RELAY_PORT="${RELAY_PORT:-443}"
-    UPSTREAM_PORT="${UPSTREAM_PORT:-7443}"
-    CONN_LIMIT="${CONN_LIMIT:-64}"
-    RELAY_SNI="${RELAY_SNI:-${SNI_POOL[$((RANDOM % ${#SNI_POOL[@]}))]}}"
-    UPSTREAM_1_TLS_SNI="${UPSTREAM_1_TLS_SNI:-${UPSTREAM_1_IP:-}}"
-    UPSTREAM_2_TLS_SNI="${UPSTREAM_2_TLS_SNI:-${UPSTREAM_2_IP:-}}"
-    UPSTREAM_ALLOW_INSECURE="${UPSTREAM_ALLOW_INSECURE:-true}"
+    local query=""
+    if [[ "$rest" == *"?"* ]]; then
+        query="${rest#*\?}"
+        rest="${rest%%\?*}"
+    fi
 
-    local err=0
-    for v in UUID UPSTREAM_UUID UPSTREAM_1_IP UPSTREAM_2_IP; do
-        [[ -z "${!v:-}" ]] && { warn "Обязательная переменная не задана: $v"; (( err++ )); }
+    [[ "$rest" =~ ^([^@]+)@([^:]+):([0-9]+)$ ]] \
+        || die "Ожидалось vless://UUID@HOST:PORT, получено: $rest"
+
+    eval "UP${idx}_UUID='${BASH_REMATCH[1]}'"
+    eval "UP${idx}_HOST='${BASH_REMATCH[2]}'"
+    eval "UP${idx}_PORT='${BASH_REMATCH[3]}'"
+    eval "UP${idx}_NAME='$frag'"
+
+    # дефолты
+    eval "UP${idx}_TYPE=tcp"
+    eval "UP${idx}_SECURITY=reality"
+    eval "UP${idx}_FP=chrome"
+    eval "UP${idx}_FLOW=''"
+    eval "UP${idx}_SNI=''"
+    eval "UP${idx}_PBK=''"
+    eval "UP${idx}_SID=''"
+
+    local IFS='&'
+    for kv in $query; do
+        [[ "$kv" =~ ^([^=]+)=(.*)$ ]] || continue
+        local k="${BASH_REMATCH[1]}" v
+        v=$(urldecode "${BASH_REMATCH[2]}")
+        case "$k" in
+            type)     eval "UP${idx}_TYPE='$v'" ;;
+            security) eval "UP${idx}_SECURITY='$v'" ;;
+            sni)      eval "UP${idx}_SNI='$v'" ;;
+            pbk)      eval "UP${idx}_PBK='$v'" ;;
+            sid)      eval "UP${idx}_SID='$v'" ;;
+            fp)       eval "UP${idx}_FP='$v'" ;;
+            flow)     eval "UP${idx}_FLOW='$v'" ;;
+        esac
     done
 
-    if [[ "$MODE" == "secure" ]]; then
-        for v in UPSTREAM_PUBLIC_KEY UPSTREAM_SHORT_ID; do
-            [[ -z "${!v:-}" ]] && { warn "Нужно для MODE=secure: $v"; (( err++ )); }
-        done
-        UPSTREAM_REALITY_SNI="${UPSTREAM_REALITY_SNI:-$RELAY_SNI}"
-    fi
-
-    [[ "$MODE" != "normal" && "$MODE" != "secure" ]] && \
-        die "MODE должен быть 'normal' или 'secure', получено: '$MODE'"
-
-    (( err > 0 )) && die "$err обязательных переменных не задано. Заполни /etc/relay.env"
-
-    ok "Переменные OK  (MODE=$MODE, SNI=$RELAY_SNI, PORT=$RELAY_PORT)"
+    local sec; eval "sec=\$UP${idx}_SECURITY"
+    local pbk; eval "pbk=\$UP${idx}_PBK"
+    [[ "$sec" == "reality" && -z "$pbk" ]] \
+        && die "В VLESS-ссылке #$idx нет pbk — это не Reality?"
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Зависимости
-# ══════════════════════════════════════════════════════════════════
-check_deps() {
-    local missing=()
-    for cmd in curl openssl; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
-    done
-    (( ${#missing[@]} > 0 )) && die "Не хватает команд: ${missing[*]}"
-    ok "Зависимости OK"
-}
-
-# ══════════════════════════════════════════════════════════════════
-# Установка xray (идемпотентна)
+# Установка xray
 # ══════════════════════════════════════════════════════════════════
 install_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
         local ver
         ver=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')
-        if [[ "$ver" == "$XRAY_VERSION" ]]; then
-            ok "xray $XRAY_VERSION уже установлен — пропускаю"
-            return
-        fi
-        warn "Обновляю xray: $ver → $XRAY_VERSION"
+        [[ "$ver" == "$XRAY_VERSION" ]] && { ok "xray $XRAY_VERSION уже стоит"; return; }
+        warn "Обновляю xray $ver → $XRAY_VERSION"
     fi
 
-    info "Устанавливаю xray-core $XRAY_VERSION..."
+    info "Ставлю xray-core $XRAY_VERSION"
     local arch
     case "$(uname -m)" in
         x86_64)  arch="64" ;;
@@ -115,123 +113,145 @@ install_xray() {
 
     local url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${arch}.zip"
     local tmp; tmp=$(mktemp -d)
-    # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
 
-    curl -fsSL "$url" -o "$tmp/xray.zip"
-    mkdir -p "$tmp/xray"
+    curl -fsSL "$url" -o "$tmp/x.zip"
+    mkdir -p "$tmp/x"
     if command -v unzip &>/dev/null; then
-        unzip -q "$tmp/xray.zip" -d "$tmp/xray"
+        unzip -q "$tmp/x.zip" -d "$tmp/x"
     elif command -v python3 &>/dev/null; then
-        python3 -c "import zipfile; zipfile.ZipFile('$tmp/xray.zip').extractall('$tmp/xray')"
+        python3 -c "import zipfile; zipfile.ZipFile('$tmp/x.zip').extractall('$tmp/x')"
     else
-        die "Нет ни unzip ни python3 для распаковки. Установи: apt-get install unzip"
+        apt-get install -y -qq unzip 2>/dev/null && unzip -q "$tmp/x.zip" -d "$tmp/x" \
+            || die "Нет unzip и python3"
     fi
-    install -m 755 "$tmp/xray/xray" "$XRAY_BIN"
-
+    install -m 755 "$tmp/x/xray" "$XRAY_BIN"
     mkdir -p "$XRAY_CONF_DIR" "$XRAY_LOG_DIR"
-
-    ok "xray $("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}') установлен"
+    ok "xray $($XRAY_BIN version | awk 'NR==1{print $2}') установлен"
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Предварительная проверка upstream
+# Outbound JSON для одного upstream
 # ══════════════════════════════════════════════════════════════════
-healthcheck_upstream() {
-    info "Проверяю доступность upstream серверов..."
-    local reachable=0
-    for n in 1 2; do
-        local ip_var="UPSTREAM_${n}_IP"
-        local ip="${!ip_var}"
-        if (echo >/dev/tcp/"$ip"/"$UPSTREAM_PORT") 2>/dev/null; then
-            ok "Upstream $n  ($ip:$UPSTREAM_PORT) — доступен"
-            (( reachable++ ))
-        else
-            warn "Upstream $n  ($ip:$UPSTREAM_PORT) — недоступен"
-            warn "  → Добавь inbound на VPS (см. вывод в конце скрипта)"
-        fi
-    done
-    (( reachable == 0 )) && warn "Оба upstream недоступны — xray поднимется, но трафик не пройдёт"
-    return 0
-}
+build_outbound() {
+    local i=$1
+    local uuid host port type security sni pbk sid fp flow
+    eval "uuid=\$UP${i}_UUID"
+    eval "host=\$UP${i}_HOST"
+    eval "port=\$UP${i}_PORT"
+    eval "type=\$UP${i}_TYPE"
+    eval "security=\$UP${i}_SECURITY"
+    eval "sni=\$UP${i}_SNI"
+    eval "pbk=\$UP${i}_PBK"
+    eval "sid=\$UP${i}_SID"
+    eval "fp=\$UP${i}_FP"
+    eval "flow=\$UP${i}_FLOW"
 
-# ══════════════════════════════════════════════════════════════════
-# Строители outbound-блоков (вызываются из generate_config)
-# ══════════════════════════════════════════════════════════════════
-_build_tls_outbound() {
-    local tag=$1 ip=$2 sni=$3
-    cat <<EOF
-    {
-      "tag": "$tag",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [{
-          "address": "$ip",
-          "port": $UPSTREAM_PORT,
-          "users": [{"id": "$UPSTREAM_UUID", "encryption": "none"}]
-        }]
-      },
-      "streamSettings": {
-        "network": "tcp",
+    local stream
+    if [[ "$security" == "reality" ]]; then
+        stream=$(cat <<JSON
+        "network": "$type",
+        "security": "reality",
+        "realitySettings": {
+          "fingerprint": "$fp",
+          "serverName": "$sni",
+          "publicKey": "$pbk",
+          "shortId": "$sid"
+        }
+JSON
+)
+    else
+        stream=$(cat <<JSON
+        "network": "$type",
         "security": "tls",
         "tlsSettings": {
           "serverName": "$sni",
-          "allowInsecure": $UPSTREAM_ALLOW_INSECURE,
-          "fingerprint": "chrome"
+          "fingerprint": "$fp",
+          "allowInsecure": false
         }
-      }
-    }
-EOF
-}
+JSON
+)
+    fi
 
-_build_reality_outbound() {
-    local tag=$1 ip=$2
-    cat <<EOF
+    cat <<JSON
     {
-      "tag": "$tag",
+      "tag": "UP_$i",
       "protocol": "vless",
       "settings": {
         "vnext": [{
-          "address": "$ip",
-          "port": $UPSTREAM_PORT,
-          "users": [{"id": "$UPSTREAM_UUID", "encryption": "none"}]
+          "address": "$host",
+          "port": $port,
+          "users": [{
+            "id": "$uuid",
+            "encryption": "none",
+            "flow": "$flow"
+          }]
         }]
       },
       "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "fingerprint": "chrome",
-          "serverName": "$UPSTREAM_REALITY_SNI",
-          "publicKey": "$UPSTREAM_PUBLIC_KEY",
-          "shortId": "$UPSTREAM_SHORT_ID"
-        }
+$stream
       }
     }
-EOF
+JSON
 }
 
 # ══════════════════════════════════════════════════════════════════
 # Генерация конфига
 # ══════════════════════════════════════════════════════════════════
 generate_config() {
-    info "Генерирую конфиг xray (MODE=$MODE)..."
+    info "Генерирую конфиг xray"
 
-    # Reality keypair для inbound (клиент → relay)
     local keys priv_key pub_key short_id
     keys=$("$XRAY_BIN" x25519 2>/dev/null)
     priv_key=$(awk '/Private/{print $3}' <<< "$keys")
     pub_key=$(awk '/Public/{print $3}'   <<< "$keys")
     short_id=$(openssl rand -hex 8)
+    [[ -z "${RELAY_UUID:-}" ]] && RELAY_UUID=$("$XRAY_BIN" uuid 2>/dev/null)
 
-    # Outbound-блоки в зависимости от режима
-    local out1 out2
-    if [[ "$MODE" == "secure" ]]; then
-        out1=$(_build_reality_outbound "UPSTREAM_1" "$UPSTREAM_1_IP")
-        out2=$(_build_reality_outbound "UPSTREAM_2" "$UPSTREAM_2_IP")
+    # outbounds
+    local outs="" sel=""
+    for ((i=1; i<=UPCOUNT; i++)); do
+        outs+="$(build_outbound "$i"),"$'\n'
+        sel+="\"UP_$i\","
+    done
+    sel="${sel%,}"
+
+    # routing — balancer если несколько, иначе прямой outboundTag
+    local routing
+    if (( UPCOUNT > 1 )); then
+        routing=$(cat <<JSON
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {"type": "field", "ip": ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"], "outboundTag": "BLOCK"},
+      {"type": "field", "inboundTag": ["CLIENT_IN"], "balancerTag": "up"}
+    ],
+    "balancers": [
+      {"tag": "up", "selector": [$sel], "strategy": {"type": "leastPing"}}
+    ]
+  },
+  "burstObservatory": {
+    "subjectSelector": [$sel],
+    "pingConfig": {
+      "destination": "https://1.1.1.1/cdn-cgi/trace",
+      "interval":    "30s",
+      "timeout":     "5s",
+      "samplingCount": 3
+    }
+  }
+JSON
+)
     else
-        out1=$(_build_tls_outbound "UPSTREAM_1" "$UPSTREAM_1_IP" "$UPSTREAM_1_TLS_SNI")
-        out2=$(_build_tls_outbound "UPSTREAM_2" "$UPSTREAM_2_IP" "$UPSTREAM_2_TLS_SNI")
+        routing=$(cat <<JSON
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {"type": "field", "ip": ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"], "outboundTag": "BLOCK"},
+      {"type": "field", "inboundTag": ["CLIENT_IN"], "outboundTag": "UP_1"}
+    ]
+  }
+JSON
+)
     fi
 
     cat > "$XRAY_CONF" <<EOF
@@ -242,118 +262,71 @@ generate_config() {
     "error":  "${XRAY_LOG_DIR}/error.log"
   },
   "policy": {
-    "levels": {
-      "0": {
-        "handshake":    4,
-        "connIdle":     120,
-        "uplinkOnly":   2,
-        "downlinkOnly": 5
-      }
-    }
+    "levels": {"0": {"handshake": 4, "connIdle": 120, "uplinkOnly": 2, "downlinkOnly": 5}}
   },
-  "inbounds": [
-    {
-      "tag": "CLIENT_IN",
-      "listen": "0.0.0.0",
-      "port": $RELAY_PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision",
-            "email": "relay-client",
-            "level": 0
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${RELAY_SNI}:443",
-          "xver": 0,
-          "serverNames": ["$RELAY_SNI"],
-          "privateKey": "$priv_key",
-          "shortIds": ["$short_id"]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+  "inbounds": [{
+    "tag": "CLIENT_IN",
+    "listen": "0.0.0.0",
+    "port": $RELAY_PORT,
+    "protocol": "vless",
+    "settings": {
+      "clients": [{"id": "$RELAY_UUID", "flow": "xtls-rprx-vision", "email": "relay-client", "level": 0}],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "${RELAY_SNI}:443",
+        "xver": 0,
+        "serverNames": ["$RELAY_SNI"],
+        "privateKey": "$priv_key",
+        "shortIds": ["$short_id"]
       }
-    }
-  ],
+    },
+    "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+  }],
   "outbounds": [
-$out1,
-$out2,
-    {"protocol": "freedom",   "tag": "DIRECT"},
+$outs    {"protocol": "freedom",   "tag": "DIRECT"},
     {"protocol": "blackhole", "tag": "BLOCK"}
   ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {
-        "type": "field",
-        "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-        "outboundTag": "BLOCK"
-      },
-      {
-        "type": "field",
-        "inboundTag": ["CLIENT_IN"],
-        "balancerTag": "upstream_balancer"
-      }
-    ],
-    "balancers": [
-      {
-        "tag": "upstream_balancer",
-        "selector": ["UPSTREAM_1", "UPSTREAM_2"],
-        "strategy": {"type": "leastPing"}
-      }
-    ]
-  },
-  "burstObservatory": {
-    "subjectSelector": ["UPSTREAM_1", "UPSTREAM_2"],
-    "pingConfig": {
-      "destination":    "https://1.1.1.1/cdn-cgi/trace",
-      "interval":       "30s",
-      "timeout":        "5s",
-      "samplingCount":  3
-    }
-  }
+$routing
 }
 EOF
 
-    "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 || die "Конфиг не прошёл валидацию xray"
-    ok "Конфиг записан: $XRAY_CONF"
-
-    # Сохраняем состояние (pub info только — без private key)
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 | tail -5 || die "Конфиг не валиден"
     chmod 600 "$XRAY_CONF"
+    ok "Конфиг $XRAY_CONF"
+
+    # state
+    local upstreams_json="["
+    for ((i=1; i<=UPCOUNT; i++)); do
+        local h p n
+        eval "h=\$UP${i}_HOST"; eval "p=\$UP${i}_PORT"; eval "n=\$UP${i}_NAME"
+        upstreams_json+="{\"name\":\"$n\",\"host\":\"$h\",\"port\":$p},"
+    done
+    upstreams_json="${upstreams_json%,}]"
+
     cat > "$STATE_FILE" <<EOF
 {
-  "mode":          "$MODE",
-  "relay_port":    $RELAY_PORT,
-  "relay_sni":     "$RELAY_SNI",
-  "uuid":          "$UUID",
-  "public_key":    "$pub_key",
-  "short_id":      "$short_id",
-  "upstream_1_ip": "$UPSTREAM_1_IP",
-  "upstream_2_ip": "$UPSTREAM_2_IP",
-  "upstream_port": $UPSTREAM_PORT,
-  "upstream_uuid": "$UPSTREAM_UUID",
-  "installed_at":  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "relay_port":  $RELAY_PORT,
+  "relay_sni":   "$RELAY_SNI",
+  "uuid":        "$RELAY_UUID",
+  "public_key":  "$pub_key",
+  "short_id":    "$short_id",
+  "upstreams":   $upstreams_json,
+  "installed_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
     chmod 600 "$STATE_FILE"
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Systemd: сервис + таймер healthcheck
+# systemd
 # ══════════════════════════════════════════════════════════════════
 setup_systemd() {
-    info "Настраиваю systemd..."
+    info "systemd"
 
     cat > /etc/systemd/system/xray-relay.service <<'EOF'
 [Unit]
@@ -379,153 +352,43 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-    # Скрипт healthcheck (работает независимо)
-    cat > /usr/local/bin/check-relay.sh <<'CHKEOF'
-#!/usr/bin/env bash
-STATE="/etc/relay-state.json"
-LOG="/var/log/xray/healthcheck.log"
-[[ ! -f "$STATE" ]] && { echo "State not found: $STATE"; exit 1; }
-
-UP1=$(jq -r .upstream_1_ip "$STATE")
-UP2=$(jq -r .upstream_2_ip "$STATE")
-PORT=$(jq -r .upstream_port "$STATE")
-RPORT=$(jq -r .relay_port   "$STATE")
-TS=$(date '+%Y-%m-%d %H:%M:%S')
-
-tcp_check() { (echo >/dev/tcp/"$1"/"$2") 2>/dev/null && echo "UP" || echo "DOWN"; }
-
-SVC=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
-PORT_OK=$(ss -tlnp | grep -q ":$RPORT " && echo "LISTEN" || echo "CLOSED")
-U1=$(tcp_check "$UP1" "$PORT")
-U2=$(tcp_check "$UP2" "$PORT")
-
-MSG="$TS  svc=$SVC  port=$RPORT($PORT_OK)  up1=${UP1}:${U1}  up2=${UP2}:${U2}"
-echo "$MSG" | tee -a "$LOG"
-
-# Авто-рестарт если сервис упал
-if [[ "$SVC" != "active" ]]; then
-    echo "$TS  [WARN] xray-relay down — restarting" | tee -a "$LOG"
-    systemctl restart xray-relay
-fi
-
-# Ротация лога если > 10 МБ
-[[ -f "$LOG" ]] && (( $(stat -c%s "$LOG" 2>/dev/null || echo 0) > 10485760 )) && \
-    mv "$LOG" "${LOG}.1" && touch "$LOG"
-CHKEOF
-    chmod +x /usr/local/bin/check-relay.sh
-
-    cat > /etc/systemd/system/relay-healthcheck.service <<'EOF'
-[Unit]
-Description=Relay Upstream Healthcheck (oneshot)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/check-relay.sh
-EOF
-
-    cat > /etc/systemd/system/relay-healthcheck.timer <<'EOF'
-[Unit]
-Description=Relay Upstream Healthcheck — каждые 5 минут
-
-[Timer]
-OnBootSec=60s
-OnUnitActiveSec=5min
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-EOF
-
     systemctl daemon-reload
     systemctl enable --quiet xray-relay
-    systemctl enable --quiet relay-healthcheck.timer
     systemctl restart xray-relay
-    systemctl start  relay-healthcheck.timer
-
     sleep 2
-    systemctl is-active --quiet xray-relay || \
-        die "xray-relay не запустился. Диагностика: journalctl -u xray-relay -n 50"
-
-    ok "xray-relay   запущен"
-    ok "healthcheck  timer активен (каждые 5 мин)"
+    systemctl is-active --quiet xray-relay \
+        || die "xray-relay не стартует. journalctl -u xray-relay -n 50"
+    ok "xray-relay активен"
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Firewall + лимит подключений
+# Firewall
 # ══════════════════════════════════════════════════════════════════
-setup_security() {
-    info "Настраиваю firewall (iptables)..."
-
-    # Разрешаем SSH и relay порт
+setup_firewall() {
+    info "iptables"
     iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null  || iptables -A INPUT -p tcp --dport 22 -j ACCEPT
     iptables -C INPUT -p tcp --dport "$RELAY_PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$RELAY_PORT" -j ACCEPT
-
-    # Лимит соединений на порт relay (per source IP)
-    local ipt_rule="-p tcp --dport $RELAY_PORT --syn -m connlimit --connlimit-above $CONN_LIMIT --connlimit-mask 32 -j REJECT --reject-with tcp-reset"
+    local rule="-p tcp --dport $RELAY_PORT --syn -m connlimit --connlimit-above $CONN_LIMIT --connlimit-mask 32 -j REJECT --reject-with tcp-reset"
     # shellcheck disable=SC2086
-    iptables -C INPUT $ipt_rule 2>/dev/null || iptables -A INPUT $ipt_rule
-
-    # Сохраняем правила
+    iptables -C INPUT $rule 2>/dev/null || iptables -A INPUT $rule
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-
-    ok "iptables: порт $RELAY_PORT/tcp открыт"
-    ok "iptables: conn limit $CONN_LIMIT/IP на порту $RELAY_PORT"
+    ok "порт $RELAY_PORT/tcp открыт, лимит $CONN_LIMIT/IP"
 }
 
 # ══════════════════════════════════════════════════════════════════
 # BBR
 # ══════════════════════════════════════════════════════════════════
 setup_bbr() {
-    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-        ok "BBR уже активен"
-        return
-    fi
-    grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null || \
-        printf '\n# BBR\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' \
-        >> /etc/sysctl.conf
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && { ok "BBR ON"; return; }
+    grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null \
+        || printf '\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> /etc/sysctl.conf
     sysctl -p > /dev/null 2>&1 || true
     ok "BBR включён"
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Проверка IP в белых списках RU-сегмента (pure bash, без python)
-# ══════════════════════════════════════════════════════════════════
-_ip_to_int() {
-    local a b c d; IFS='.' read -r a b c d <<< "$1"
-    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
-}
-
-_in_cidr() {
-    local net=${2%/*} pfx=${2#*/}
-    local ip_int net_int mask
-    ip_int=$(_ip_to_int "$1")
-    net_int=$(_ip_to_int "$net")
-    mask=$(( (0xFFFFFFFF << (32 - pfx)) & 0xFFFFFFFF ))
-    return $(( (ip_int & mask) != (net_int & mask) ))
-}
-
-check_whitelist_ip() {
-    local ip=$1
-    local -a ranges=(
-        "84.201.0.0/16"    "84.252.128.0/17"  "130.193.32.0/19"
-        "158.160.0.0/16"   "51.250.0.0/16"    "89.249.160.0/21"
-        "62.84.112.0/20"   "178.154.128.0/17" "93.158.128.0/18"
-        "94.100.0.0/16"    "217.69.128.0/17"  "195.239.160.0/20"
-        "185.30.176.0/22"  "194.67.0.0/16"
-        "185.231.204.0/22" "185.233.116.0/22"
-    )
-    for cidr in "${ranges[@]}"; do
-        if _in_cidr "$ip" "$cidr"; then
-            echo "$cidr"
-            return
-        fi
-    done
-    echo ""
-}
-
-# ══════════════════════════════════════════════════════════════════
-# Итоговый вывод
+# Финальный вывод
 # ══════════════════════════════════════════════════════════════════
 print_output() {
     local relay_ip
@@ -538,146 +401,100 @@ print_output() {
     short_id=$(jq -r .short_id  "$STATE_FILE")
     uuid=$(jq -r .uuid          "$STATE_FILE")
 
-    local vless_link="vless://${uuid}@${relay_ip}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${RELAY_SNI}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${relay_ip}"
-
-    # Inbound JSON для Marzban на VPS
-    local marzban_json
-    if [[ "$MODE" == "normal" ]]; then
-        marzban_json=$(cat <<EOF
-{
-  "tag": "RELAY-RU-${relay_ip}",
-  "listen": "0.0.0.0",
-  "port": $UPSTREAM_PORT,
-  "protocol": "vless",
-  "settings": {
-    "clients": [
-      {"id": "$UPSTREAM_UUID", "email": "relay-ru", "encryption": "none"}
-    ],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "tls",
-    "tlsSettings": {
-      "certificates": [{
-        "certificateFile": "/etc/ssl/xray/relay.crt",
-        "keyFile":         "/etc/ssl/xray/relay.key"
-      }]
-    }
-  }
-}
-EOF
-)
-    else
-        marzban_json=$(cat <<EOF
-{
-  "tag": "RELAY-RU-${relay_ip}",
-  "listen": "0.0.0.0",
-  "port": $UPSTREAM_PORT,
-  "protocol": "vless",
-  "settings": {
-    "clients": [
-      {"id": "$UPSTREAM_UUID", "email": "relay-ru", "encryption": "none"}
-    ],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-      "show": false,
-      "dest": "ya.ru:443",
-      "xver": 0,
-      "serverNames": ["ya.ru"],
-      "privateKey": "<СГЕНЕРИРУЙ НА VPS: xray x25519>",
-      "shortIds": ["$UPSTREAM_SHORT_ID"]
-    }
-  }
-}
-EOF
-)
-    fi
-
-    # Проверка белых списков
-    local wl_result
-    wl_result=$(check_whitelist_ip "$relay_ip")
+    local link="vless://${uuid}@${relay_ip}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${RELAY_SNI}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${relay_ip}"
 
     echo ""
     hr
-    echo -e "${CB}${CG}  Relay готов!  IP: ${relay_ip}${NC}"
+    echo -e "${CB}${CG}  Relay готов!  IP: $relay_ip${NC}"
     hr
 
-    echo -e "\n${CB}1. VLESS-ссылка (добавить в Marzban или клиент):${NC}"
-    echo -e "${CY}$vless_link${NC}"
+    echo -e "\n${CB}VLESS-ссылка для клиента (импорт в v2rayNG / Hiddify / Marzban):${NC}"
+    echo -e "${CY}$link${NC}"
 
-    echo -e "\n${CB}2. Inbound для Marzban на VPS (оба NL и FI):${NC}"
-    echo "   Marzban panel → Xray Settings → \"inbounds\" → добавить блок:"
-    echo ""
-    echo "$marzban_json" | jq . 2>/dev/null || echo "$marzban_json"
-
-    if [[ "$MODE" == "normal" ]]; then
-        echo ""
-        echo -e "${CY}   ▶ MODE=normal: на VPS нужен TLS-сертификат.${NC}"
-        echo "     Запусти на каждом VPS (NL и FI):"
-        echo "     mkdir -p /etc/ssl/xray && openssl req -x509 -newkey rsa:2048 \\"
-        echo "       -keyout /etc/ssl/xray/relay.key -out /etc/ssl/xray/relay.crt \\"
-        echo "       -days 3650 -nodes -subj '/CN=relay'"
-        echo "     Затем перезапусти xray на VPS."
-    else
-        echo ""
-        echo -e "${CY}   ▶ MODE=secure: на VPS нужна своя Reality-пара для relay-inbound.${NC}"
-        echo "     Запусти на VPS: xray x25519"
-        echo "     Private key → в 'privateKey' выше"
-        echo "     Public key  → UPSTREAM_PUBLIC_KEY в /etc/relay.env на relay"
-        echo "     Потом: systemctl restart xray-relay  (на этой relay VM)"
-    fi
-
-    echo -e "\n${CB}3. Upstream серверы:${NC}"
-    echo "   #1 NL  $UPSTREAM_1_IP:$UPSTREAM_PORT"
-    echo "   #2 FI  $UPSTREAM_2_IP:$UPSTREAM_PORT"
-    echo "   Failover: burstObservatory + leastPing (probe каждые 30 сек)"
-
-    echo -e "\n${CB}4. Белые списки:${NC}"
-    if [[ -n "$wl_result" ]]; then
-        ok "IP $relay_ip → входит в белый список RU ($wl_result)"
-    else
-        warn "IP $relay_ip — не найден в известных RU-диапазонах"
-        warn "Убедись что VM создана в Yandex Cloud / Aeza RU / VK Cloud"
-    fi
+    echo -e "\n${CB}Upstream:${NC}"
+    for ((i=1; i<=UPCOUNT; i++)); do
+        local h p n
+        eval "h=\$UP${i}_HOST"; eval "p=\$UP${i}_PORT"; eval "n=\$UP${i}_NAME"
+        printf "  #%d  %s  %s:%d\n" "$i" "${n:-no-name}" "$h" "$p"
+    done
+    (( UPCOUNT > 1 )) && echo "  Failover: leastPing (probe 30s)"
 
     echo -e "\n${CB}Команды:${NC}"
-    echo "  systemctl status xray-relay            — статус сервиса"
-    echo "  journalctl -u xray-relay -f            — live логи"
-    echo "  check-relay.sh                         — ручная проверка"
-    echo "  tail -f /var/log/xray/healthcheck.log  — лог healthcheck"
-    echo "  cat $STATE_FILE | jq .             — параметры"
-    echo ""
+    echo "  systemctl status xray-relay     — статус"
+    echo "  journalctl -u xray-relay -f     — live логи"
+    echo "  cat $STATE_FILE | jq .          — параметры"
+    echo "  bash $0 --uninstall             — снести всё"
     hr
     echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Uninstall — для быстрого перебора VM
+# ══════════════════════════════════════════════════════════════════
+uninstall() {
+    info "Удаляю xray-relay"
+    systemctl disable --now xray-relay 2>/dev/null || true
+    rm -f /etc/systemd/system/xray-relay.service
+    systemctl daemon-reload
+    rm -rf "$XRAY_CONF_DIR" "$XRAY_LOG_DIR" "$STATE_FILE"
+    iptables -D INPUT -p tcp --dport "${RELAY_PORT:-443}" -j ACCEPT 2>/dev/null || true
+    ok "Готово. xray бинарь $XRAY_BIN не трогал — снеси вручную если надо."
+    exit 0
 }
 
 # ══════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════
 main() {
-    echo -e "\n${CB}${CC}  setup-relay.sh${NC}\n"
+    echo -e "\n${CB}${CC}  setup-relay.sh v2${NC}\n"
 
-    validate_env
-    check_deps
+    [[ $EUID -ne 0 ]] && die "Нужен root"
 
-    info "ОС: $(lsb_release -ds 2>/dev/null || uname -rs)"
+    [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]] && uninstall
+
+    [[ $# -eq 0 ]] && cat <<USAGE && exit 1
+Использование:
+  sudo bash $0 "vless://..."                  # один upstream
+  sudo bash $0 "vless://...NL" "vless://...FI" # с failover
+  sudo bash $0 --uninstall                    # снести relay
+
+ENV (необязательно):
+  RELAY_PORT=443         — порт куда подключается клиент
+  RELAY_SNI=cloudflare.com — SNI для Reality на relay
+  RELAY_UUID=<uuid>      — фиксированный UUID клиента
+  CONN_LIMIT=64          — лимит соединений с одного IP
+USAGE
+
+    RELAY_PORT="${RELAY_PORT:-443}"
+    RELAY_SNI="${RELAY_SNI:-${SNI_POOL[$((RANDOM % ${#SNI_POOL[@]}))]}}"
+    CONN_LIMIT="${CONN_LIMIT:-64}"
+
+    UPCOUNT=$#
+    local i=1
+    for link in "$@"; do
+        parse_vless "$i" "$link"
+        local h p n
+        eval "h=\$UP${i}_HOST"; eval "p=\$UP${i}_PORT"; eval "n=\$UP${i}_NAME"
+        if (echo >/dev/tcp/"$h"/"$p") 2>/dev/null; then
+            ok "Upstream #$i ${n:-} → $h:$p — доступен"
+        else
+            warn "Upstream #$i ${n:-} → $h:$p — недоступен (relay поднимется, но трафик не пройдёт)"
+        fi
+        ((i++))
+    done
+
+    info "OS: $(lsb_release -ds 2>/dev/null || uname -rs)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq 2>/dev/null || true
-    apt-get -f install -y -qq 2>/dev/null || true
-    for pkg in curl unzip jq iptables-persistent; do
-        apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не удалось установить $pkg — продолжаю"
+    for pkg in curl jq iptables-persistent; do
+        command -v "${pkg%%-*}" &>/dev/null && continue
+        apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не поставил $pkg"
     done
 
     install_xray
-    healthcheck_upstream
     generate_config
     setup_systemd
-    setup_security
+    setup_firewall
     setup_bbr
     print_output
 }
