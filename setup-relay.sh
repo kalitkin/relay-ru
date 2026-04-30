@@ -291,10 +291,12 @@ JSON
 )
     fi
 
+    mkdir -p "$XRAY_CONF_DIR" "$XRAY_LOG_DIR"
+
     cat > "$XRAY_CONF" <<EOF
 {
   "log": {
-    "loglevel": "warning",
+    "loglevel": "${LOG_LEVEL:-warning}",
     "access": "${XRAY_LOG_DIR}/access.log",
     "error":  "${XRAY_LOG_DIR}/error.log"
   },
