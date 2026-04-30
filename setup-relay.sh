@@ -64,7 +64,7 @@ expand_arg() {
             EXPANDED_LINKS+=("$line")
             count=$((count + 1))
         done <<< "$body"
-        (( count == 0 )) && die "Из подписки не извлечено ни одной VLESS-ссылки"
+        if (( count == 0 )); then die "Из подписки не извлечено ни одной VLESS-ссылки"; fi
         ok "Из подписки получено $count VLESS-ссылок"
         return
     fi
@@ -91,19 +91,19 @@ parse_vless() {
     [[ "$rest" =~ ^([^@]+)@([^:]+):([0-9]+)$ ]] \
         || die "Ожидалось vless://UUID@HOST:PORT, получено: $rest"
 
-    eval "UP${idx}_UUID='${BASH_REMATCH[1]}'"
-    eval "UP${idx}_HOST='${BASH_REMATCH[2]}'"
-    eval "UP${idx}_PORT='${BASH_REMATCH[3]}'"
-    eval "UP${idx}_NAME='$frag'"
+    printf -v "UP${idx}_UUID" '%s' "${BASH_REMATCH[1]}"
+    printf -v "UP${idx}_HOST" '%s' "${BASH_REMATCH[2]}"
+    printf -v "UP${idx}_PORT" '%s' "${BASH_REMATCH[3]}"
+    printf -v "UP${idx}_NAME" '%s' "$frag"
 
     # дефолты
-    eval "UP${idx}_TYPE=tcp"
-    eval "UP${idx}_SECURITY=reality"
-    eval "UP${idx}_FP=chrome"
-    eval "UP${idx}_FLOW=''"
-    eval "UP${idx}_SNI=''"
-    eval "UP${idx}_PBK=''"
-    eval "UP${idx}_SID=''"
+    printf -v "UP${idx}_TYPE"     '%s' "tcp"
+    printf -v "UP${idx}_SECURITY" '%s' "reality"
+    printf -v "UP${idx}_FP"       '%s' "chrome"
+    printf -v "UP${idx}_FLOW"     '%s' ""
+    printf -v "UP${idx}_SNI"      '%s' ""
+    printf -v "UP${idx}_PBK"      '%s' ""
+    printf -v "UP${idx}_SID"      '%s' ""
 
     local IFS='&'
     for kv in $query; do
@@ -111,20 +111,21 @@ parse_vless() {
         local k="${BASH_REMATCH[1]}" v
         v=$(urldecode "${BASH_REMATCH[2]}")
         case "$k" in
-            type)     eval "UP${idx}_TYPE='$v'" ;;
-            security) eval "UP${idx}_SECURITY='$v'" ;;
-            sni)      eval "UP${idx}_SNI='$v'" ;;
-            pbk)      eval "UP${idx}_PBK='$v'" ;;
-            sid)      eval "UP${idx}_SID='$v'" ;;
-            fp)       eval "UP${idx}_FP='$v'" ;;
-            flow)     eval "UP${idx}_FLOW='$v'" ;;
+            type)     printf -v "UP${idx}_TYPE"     '%s' "$v" ;;
+            security) printf -v "UP${idx}_SECURITY" '%s' "$v" ;;
+            sni)      printf -v "UP${idx}_SNI"      '%s' "$v" ;;
+            pbk)      printf -v "UP${idx}_PBK"      '%s' "$v" ;;
+            sid)      printf -v "UP${idx}_SID"      '%s' "$v" ;;
+            fp)       printf -v "UP${idx}_FP"       '%s' "$v" ;;
+            flow)     printf -v "UP${idx}_FLOW"     '%s' "$v" ;;
         esac
     done
 
-    local sec; eval "sec=\$UP${idx}_SECURITY"
-    local pbk; eval "pbk=\$UP${idx}_PBK"
-    [[ "$sec" == "reality" && -z "$pbk" ]] \
-        && die "В VLESS-ссылке #$idx нет pbk — это не Reality?"
+    local sec_var="UP${idx}_SECURITY" pbk_var="UP${idx}_PBK"
+    local sec="${!sec_var}" pbk="${!pbk_var}"
+    if [[ "$sec" == "reality" && -z "$pbk" ]]; then
+        die "В VLESS-ссылке #$idx нет pbk — это не Reality?"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -453,7 +454,7 @@ print_output() {
         eval "h=\$UP${i}_HOST"; eval "p=\$UP${i}_PORT"; eval "n=\$UP${i}_NAME"
         printf "  #%d  %s  %s:%d\n" "$i" "${n:-no-name}" "$h" "$p"
     done
-    (( UPCOUNT > 1 )) && echo "  Failover: leastPing (probe 30s)"
+    if (( UPCOUNT > 1 )); then echo "  Failover: leastPing (probe 30s)"; fi
 
     echo -e "\n${CB}Команды:${NC}"
     echo "  systemctl status xray-relay     — статус"
@@ -520,7 +521,8 @@ USAGE
     done
 
     UPCOUNT=${#EXPANDED_LINKS[@]}
-    (( UPCOUNT == 0 )) && die "Не получено ни одной VLESS-ссылки"
+    if (( UPCOUNT == 0 )); then die "Не получено ни одной VLESS-ссылки"; fi
+    info "Парсинг $UPCOUNT VLESS-ссылок..."
 
     local i=1
     for link in "${EXPANDED_LINKS[@]}"; do
