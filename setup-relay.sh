@@ -62,7 +62,7 @@ expand_arg() {
         while IFS= read -r line; do
             [[ "$line" =~ ^vless:// ]] || continue
             EXPANDED_LINKS+=("$line")
-            ((count++))
+            count=$((count + 1))
         done <<< "$body"
         (( count == 0 )) && die "Из подписки не извлечено ни одной VLESS-ссылки"
         ok "Из подписки получено $count VLESS-ссылок"
@@ -532,7 +532,7 @@ USAGE
         else
             warn "Upstream #$i ${n:-} → $h:$p — недоступен (relay поднимется, но трафик не пройдёт)"
         fi
-        ((i++))
+        i=$((i + 1))
     done
 
     install_xray
