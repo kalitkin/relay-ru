@@ -643,7 +643,8 @@ USAGE
 
     RELAY_PORT="${RELAY_PORT:-443}"
     RELAY_SNI="${RELAY_SNI:-${SNI_POOL[$((RANDOM % ${#SNI_POOL[@]}))]}}"
-    CONN_LIMIT="${CONN_LIMIT:-64}"
+    # 2048 — учитываем CGNAT мобильных операторов РФ (один внешний IP на тысячи абонентов)
+    CONN_LIMIT="${CONN_LIMIT:-2048}"
 
     info "OS: $(lsb_release -ds 2>/dev/null || uname -rs)"
     export DEBIAN_FRONTEND=noninteractive
