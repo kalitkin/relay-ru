@@ -391,13 +391,79 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
+    # Healthcheck скрипт
+    cat > /usr/local/bin/relay-healthcheck <<'CHKEOF'
+#!/usr/bin/env bash
+STATE="/etc/relay-state.json"
+LOG="/var/log/xray/healthcheck.log"
+[[ ! -f "$STATE" ]] && { echo "State not found"; exit 1; }
+TS=$(date '+%Y-%m-%d %H:%M:%S')
+RPORT=$(jq -r .relay_port "$STATE")
+SVC=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
+PORT_OK=$(ss -tlnp 2>/dev/null | grep -q ":$RPORT " && echo "LISTEN" || echo "CLOSED")
+
+# upstream availability
+UPS=""
+COUNT=$(jq -r '.upstreams | length' "$STATE")
+for ((i=0; i<COUNT; i++)); do
+    H=$(jq -r ".upstreams[$i].host" "$STATE")
+    P=$(jq -r ".upstreams[$i].port" "$STATE")
+    if (echo >/dev/tcp/"$H"/"$P") 2>/dev/null; then
+        UPS+="$H:$P=UP "
+    else
+        UPS+="$H:$P=DOWN "
+    fi
+done
+
+MSG="$TS  svc=$SVC  port=$RPORT($PORT_OK)  $UPS"
+echo "$MSG" | tee -a "$LOG" >/dev/null
+
+# auto-restart если сервис упал
+if [[ "$SVC" != "active" ]]; then
+    echo "$TS  [WARN] xray-relay down — restarting" | tee -a "$LOG" >/dev/null
+    systemctl restart xray-relay
+fi
+
+# rotate если > 10 МБ
+if [[ -f "$LOG" ]] && (( $(stat -c%s "$LOG" 2>/dev/null || echo 0) > 10485760 )); then
+    mv "$LOG" "${LOG}.1"
+    touch "$LOG"
+fi
+CHKEOF
+    chmod +x /usr/local/bin/relay-healthcheck
+
+    cat > /etc/systemd/system/relay-healthcheck.service <<'EOF'
+[Unit]
+Description=Relay Healthcheck (oneshot)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/relay-healthcheck
+EOF
+
+    cat > /etc/systemd/system/relay-healthcheck.timer <<'EOF'
+[Unit]
+Description=Relay Healthcheck — каждые 5 минут
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
     systemctl daemon-reload
     systemctl enable --quiet xray-relay
+    systemctl enable --quiet relay-healthcheck.timer
     systemctl restart xray-relay
+    systemctl start  relay-healthcheck.timer
     sleep 2
     systemctl is-active --quiet xray-relay \
         || die "xray-relay не стартует. journalctl -u xray-relay -n 50"
     ok "xray-relay активен"
+    ok "relay-healthcheck timer (каждые 5 мин)"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -459,8 +525,10 @@ print_output() {
     if (( UPCOUNT > 1 )); then echo "  Failover: leastPing (probe 30s)"; fi
 
     echo -e "\n${CB}Команды:${NC}"
-    echo "  systemctl status xray-relay     — статус"
-    echo "  journalctl -u xray-relay -f     — live логи"
+    echo "  bash $0 --status                — состояние relay (сервис/порт/upstream'ы)"
+    echo "  systemctl status xray-relay     — статус сервиса"
+    echo "  journalctl -u xray-relay -f     — live логи xray"
+    echo "  tail -f /var/log/xray/healthcheck.log — лог healthcheck"
     echo "  cat $STATE_FILE | jq .          — параметры"
     echo "  bash $0 --uninstall             — снести всё"
     hr
@@ -473,11 +541,74 @@ print_output() {
 uninstall() {
     info "Удаляю xray-relay"
     systemctl disable --now xray-relay 2>/dev/null || true
+    systemctl disable --now relay-healthcheck.timer 2>/dev/null || true
     rm -f /etc/systemd/system/xray-relay.service
+    rm -f /etc/systemd/system/relay-healthcheck.service
+    rm -f /etc/systemd/system/relay-healthcheck.timer
+    rm -f /usr/local/bin/relay-healthcheck
     systemctl daemon-reload
     rm -rf "$XRAY_CONF_DIR" "$XRAY_LOG_DIR" "$STATE_FILE"
     iptables -D INPUT -p tcp --dport "${RELAY_PORT:-443}" -j ACCEPT 2>/dev/null || true
     ok "Готово. xray бинарь $XRAY_BIN не трогал — снеси вручную если надо."
+    exit 0
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Status — on-demand проверка без модификации системы
+# ══════════════════════════════════════════════════════════════════
+status() {
+    local STATE="/etc/relay-state.json"
+    [[ ! -f "$STATE" ]] && die "State не найден ($STATE) — relay не установлен"
+
+    local rport rsni uuid pub_key short_id installed
+    rport=$(jq -r .relay_port   "$STATE")
+    rsni=$(jq -r  .relay_sni    "$STATE")
+    uuid=$(jq -r  .uuid         "$STATE")
+    pub_key=$(jq -r .public_key "$STATE")
+    short_id=$(jq -r .short_id  "$STATE")
+    installed=$(jq -r .installed_at "$STATE")
+
+    local svc port_state ext_ip
+    svc=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
+    ss -tlnp 2>/dev/null | grep -q ":$rport " && port_state="LISTEN" || port_state="CLOSED"
+    ext_ip=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null || echo "?")
+
+    hr
+    echo -e "${CB}  RELAY STATUS  ${NC}"
+    hr
+    [[ "$svc" == "active" ]] && ok "Сервис xray-relay: active" || warn "Сервис xray-relay: $svc"
+    [[ "$port_state" == "LISTEN" ]] && ok "Порт $rport: LISTEN" || warn "Порт $rport: $port_state"
+    info "Внешний IP: $ext_ip"
+    info "SNI: $rsni"
+    info "Установлен: $installed"
+
+    echo ""
+    echo -e "${CB}Upstreams:${NC}"
+    local count
+    count=$(jq -r '.upstreams | length' "$STATE")
+    for ((i=0; i<count; i++)); do
+        local h p n
+        h=$(jq -r ".upstreams[$i].host" "$STATE")
+        p=$(jq -r ".upstreams[$i].port" "$STATE")
+        n=$(jq -r ".upstreams[$i].name" "$STATE")
+        if (echo >/dev/tcp/"$h"/"$p") 2>/dev/null; then
+            ok "  #$((i+1)) $n  $h:$p"
+        else
+            warn "  #$((i+1)) $n  $h:$p — недоступен"
+        fi
+    done
+
+    local hc_log="/var/log/xray/healthcheck.log"
+    if [[ -f "$hc_log" ]]; then
+        echo ""
+        echo -e "${CB}Healthcheck (последние 5):${NC}"
+        tail -5 "$hc_log" | sed 's/^/  /'
+    fi
+
+    echo ""
+    echo -e "${CB}VLESS-ссылка для клиента:${NC}"
+    echo -e "${CY}vless://${uuid}@${ext_ip}:${rport}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${rsni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${ext_ip}${NC}"
+    hr
     exit 0
 }
 
@@ -490,12 +621,14 @@ main() {
     [[ $EUID -ne 0 ]] && die "Нужен root"
 
     [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]] && uninstall
+    [[ "${1:-}" == "--status"    || "${1:-}" == "-s" ]] && status
 
     [[ $# -eq 0 ]] && cat <<USAGE && exit 1
 Использование:
   sudo bash $0 "vless://..."                       # одна VLESS-ссылка
   sudo bash $0 "vless://NL" "vless://FI"           # с failover
   sudo bash $0 "https://.../sub/..."               # подписка (Marzban subscription URL)
+  sudo bash $0 --status                            # текущее состояние relay
   sudo bash $0 --uninstall                         # снести relay
 
 ENV (необязательно):
@@ -503,6 +636,7 @@ ENV (необязательно):
   RELAY_SNI=cloudflare.com — SNI для Reality на relay
   RELAY_UUID=<uuid>        — фиксированный UUID клиента
   CONN_LIMIT=64            — лимит соединений с одного IP
+  LOG_LEVEL=warning        — xray loglevel (warning/info/debug)
 USAGE
 
     RELAY_PORT="${RELAY_PORT:-443}"
