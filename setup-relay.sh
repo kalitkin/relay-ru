@@ -358,7 +358,7 @@ EOF
   "installed_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    chmod 600 "$STATE_FILE"
+    chmod 644 "$STATE_FILE"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -618,10 +618,12 @@ status() {
 main() {
     echo -e "\n${CB}${CC}  setup-relay.sh v2${NC}\n"
 
+    # --status работает без root (только чтение)
+    [[ "${1:-}" == "--status"    || "${1:-}" == "-s" ]] && status
+
     [[ $EUID -ne 0 ]] && die "Нужен root"
 
     [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]] && uninstall
-    [[ "${1:-}" == "--status"    || "${1:-}" == "-s" ]] && status
 
     [[ $# -eq 0 ]] && cat <<USAGE && exit 1
 Использование:
