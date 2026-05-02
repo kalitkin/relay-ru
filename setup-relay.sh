@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# setup-relay.sh v2 — Lightweight RU-relay через существующий VLESS+Reality
+# setup-relay.sh v3 — RU-relay с VLESS+Reality+Fragment (обход МТС DPI)
 #
 # Схема:
-#   Клиент → VLESS+Reality → [этот relay (RU)] → VLESS+Reality → твой VPS:8443 → инет
+#   Клиент (HAPP/incy + fragment) → VLESS+Reality → Relay (RU IP) → VLESS+Reality → VPS:8443 → инет
 #
-# На VPS НИЧЕГО менять не надо — relay подключается к существующему inbound
-# (тому же что использует обычный клиент).
+# Fragment фрагментирует TLS ClientHello → МТС DPI не успевает изменить session ID → Reality проходит
+# На VPS НИЧЕГО менять не надо — relay подключается к существующему inbound.
 #
 # Использование:
 #   sudo bash setup-relay.sh "vless://UUID@HOST:8443?security=reality&sni=...&pbk=...&sid=...&fp=chrome&flow=xtls-rprx-vision&type=tcp#NL"
 #   sudo bash setup-relay.sh "vless://...NL" "vless://...FI"        # с failover
-#   sudo RELAY_PORT=8443 bash setup-relay.sh "vless://..."          # порт relay
+#   sudo bash setup-relay.sh "https://.../sub/..."                   # Marzban subscription URL
+#   sudo bash setup-relay.sh --status
+#   sudo bash setup-relay.sh --uninstall
 
 set -euo pipefail
 
@@ -19,8 +21,11 @@ readonly XRAY_CONF_DIR="/usr/local/etc/xray"
 readonly XRAY_CONF="$XRAY_CONF_DIR/config.json"
 readonly XRAY_LOG_DIR="/var/log/xray"
 readonly STATE_FILE="/etc/relay-state.json"
+readonly SUB_DIR="/var/www/sub"
+readonly SUB_PORT="8444"
 readonly XRAY_VERSION="${XRAY_VERSION:-25.3.6}"
-readonly -a SNI_POOL=("ya.ru" "cloudflare.com" "microsoft.com")
+# dzen.ru — проверено: работает с МТС DPI + Reality + Fragment
+readonly -a SNI_POOL=("dzen.ru" "mail.ru" "ya.ru")
 
 CR='\033[0;31m'; CG='\033[0;32m'; CY='\033[1;33m'
 CC='\033[0;36m'; CB='\033[1m'; NC='\033[0m'
@@ -35,10 +40,6 @@ hr()   { echo -e "${CC}$(printf '─%.0s' {1..60})${NC}"; }
 # ══════════════════════════════════════════════════════════════════
 urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
 
-# Раскрывает аргумент в массив VLESS-ссылок:
-# - "vless://..."           → как есть
-# - "http(s)://.../sub/..." → скачивает, base64-декодит при необходимости, режет по строкам
-# Результат пишет в EXPANDED_LINKS (глобальный массив).
 expand_arg() {
     local arg=$1
     if [[ "$arg" =~ ^vless:// ]]; then
@@ -50,7 +51,6 @@ expand_arg() {
         local body
         body=$(curl -fsSL --max-time 10 -A "v2rayNG/1.8.0" "$arg") \
             || die "Не удалось скачать подписку: $arg"
-        # base64?
         if ! grep -q "vless://" <<< "$body"; then
             local decoded
             decoded=$(echo "$body" | base64 -d 2>/dev/null || true)
@@ -96,7 +96,6 @@ parse_vless() {
     printf -v "UP${idx}_PORT" '%s' "${BASH_REMATCH[3]}"
     printf -v "UP${idx}_NAME" '%s' "$frag"
 
-    # дефолты
     printf -v "UP${idx}_TYPE"     '%s' "tcp"
     printf -v "UP${idx}_SECURITY" '%s' "reality"
     printf -v "UP${idx}_FP"       '%s' "chrome"
@@ -233,7 +232,7 @@ JSON
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Генерация конфига
+# Генерация серверного конфига
 # ══════════════════════════════════════════════════════════════════
 generate_config() {
     info "Генерирую конфиг xray"
@@ -245,7 +244,6 @@ generate_config() {
     short_id=$(openssl rand -hex 8)
     [[ -z "${RELAY_UUID:-}" ]] && RELAY_UUID=$("$XRAY_BIN" uuid 2>/dev/null)
 
-    # outbounds
     local outs="" sel=""
     for ((i=1; i<=UPCOUNT; i++)); do
         outs+="$(build_outbound "$i"),"$'\n'
@@ -253,7 +251,6 @@ generate_config() {
     done
     sel="${sel%,}"
 
-    # routing — balancer если несколько, иначе прямой outboundTag
     local routing
     if (( UPCOUNT > 1 )); then
         routing=$(cat <<JSON
@@ -293,6 +290,8 @@ JSON
 
     mkdir -p "$XRAY_CONF_DIR" "$XRAY_LOG_DIR"
 
+    # Inbound: без flow у клиентов — fragment-клиенты его не используют
+    # shortIds включает "" для совместимости с incy/HAPP которые не передают sid
     cat > "$XRAY_CONF" <<EOF
 {
   "log": {
@@ -309,7 +308,7 @@ JSON
     "port": $RELAY_PORT,
     "protocol": "vless",
     "settings": {
-      "clients": [{"id": "$RELAY_UUID", "flow": "xtls-rprx-vision", "email": "relay-client", "level": 0}],
+      "clients": [{"id": "$RELAY_UUID", "email": "relay-client", "level": 0}],
       "decryption": "none"
     },
     "streamSettings": {
@@ -321,7 +320,7 @@ JSON
         "xver": 0,
         "serverNames": ["$RELAY_SNI"],
         "privateKey": "$priv_key",
-        "shortIds": ["$short_id"]
+        "shortIds": ["$short_id", ""]
       }
     },
     "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
@@ -338,7 +337,6 @@ EOF
     chmod 600 "$XRAY_CONF"
     ok "Конфиг $XRAY_CONF"
 
-    # state
     local upstreams_json="["
     for ((i=1; i<=UPCOUNT; i++)); do
         local h p n
@@ -359,6 +357,156 @@ EOF
 }
 EOF
     chmod 644 "$STATE_FILE"
+}
+
+# ══════════════════════════════════════════════════════════════════
+# HTTPS subscription endpoint с клиентским конфигом (fragment)
+# ══════════════════════════════════════════════════════════════════
+setup_subscription() {
+    info "Настраиваю subscription endpoint (HTTPS :$SUB_PORT)"
+
+    local relay_ip pub_key short_id uuid
+    relay_ip=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null \
+             || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
+             || die "Не удалось определить внешний IP")
+    pub_key=$(jq -r .public_key "$STATE_FILE")
+    short_id=$(jq -r .short_id  "$STATE_FILE")
+    uuid=$(jq -r .uuid          "$STATE_FILE")
+
+    # LE cert через sslip.io (не нужна регистрация домена)
+    local sslip_domain
+    sslip_domain="$(echo "$relay_ip" | tr '.' '-').sslip.io"
+    local cert_dir="/etc/letsencrypt/live/${sslip_domain}"
+
+    if [[ ! -f "${cert_dir}/fullchain.pem" ]]; then
+        info "Получаю LE cert для $sslip_domain"
+        apt-get install -y -qq certbot 2>/dev/null || warn "certbot не установился — subscription без HTTPS"
+        if command -v certbot &>/dev/null; then
+            certbot certonly --standalone \
+                -d "$sslip_domain" \
+                --non-interactive --agree-tos \
+                -m "${CERTBOT_EMAIL:-kalitkinas@gmail.com}" \
+                --http-01-port 80 2>&1 | tail -5 \
+                && ok "LE cert: $sslip_domain" \
+                || warn "certbot не смог получить cert — subscription только HTTP"
+        fi
+    else
+        ok "LE cert уже есть: $sslip_domain"
+    fi
+
+    mkdir -p "$SUB_DIR"
+
+    # Клиентский конфиг с fragment — рабочий паттерн для МТС DPI
+    cat > "$SUB_DIR/relay.json" <<EOF
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "$relay_ip",
+          "port": $RELAY_PORT,
+          "users": [{"encryption": "none", "id": "$uuid", "level": 8, "security": "auto"}]
+        }]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "publicKey": "$pub_key",
+          "serverName": "$RELAY_SNI",
+          "shortId": "$short_id",
+          "show": false,
+          "spiderX": ""
+        },
+        "security": "reality",
+        "sockopt": {"dialerProxy": "fragment"},
+        "tcpSettings": {"header": {"type": "none"}}
+      },
+      "tag": "proxy"
+    },
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"},
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "AsIs",
+        "fragment": {
+          "interval": "10-20",
+          "length": "1400",
+          "maxSplit": "100-200",
+          "packets": "tlshello"
+        },
+        "userLevel": 0
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {"mark": 255, "TcpNoDelay": true}
+      },
+      "tag": "fragment"
+    }
+  ],
+  "policy": {
+    "levels": {"8": {"bufferSize": 3, "connIdle": 300, "downlinkOnly": 4, "handshake": 3, "uplinkOnly": 2}}
+  },
+  "remarks": "Relay-RU-${relay_ip}"
+}
+EOF
+
+    # Python HTTPS сервер
+    cat > "$SUB_DIR/https_server.py" <<'PYEOF'
+import http.server, ssl, os
+os.chdir('/var/www/sub')
+httpd = http.server.HTTPServer(('0.0.0.0', 8444), http.server.SimpleHTTPRequestHandler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+cert_dir = None
+import glob
+for d in glob.glob('/etc/letsencrypt/live/*/'):
+    if 'sslip.io' in d:
+        cert_dir = d.rstrip('/')
+        break
+if cert_dir:
+    ctx.load_cert_chain(cert_dir + '/fullchain.pem', cert_dir + '/privkey.pem')
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PYEOF
+
+    cat > /etc/systemd/system/relay-sub.service <<EOF
+[Unit]
+Description=Relay Subscription Server
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 $SUB_DIR/https_server.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    iptables -C INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl enable --quiet relay-sub
+    systemctl restart relay-sub
+    sleep 1
+
+    local proto="https"
+    if [[ ! -f "${cert_dir}/fullchain.pem" ]]; then proto="http"; fi
+
+    local sub_url="${proto}://${sslip_domain}:${SUB_PORT}/relay.json"
+
+    # Сохранить в state
+    python3 - <<PYEOF 2>/dev/null || true
+import json
+with open('$STATE_FILE') as f: s = json.load(f)
+s['subscription_url'] = '$sub_url'
+s['sslip_domain'] = '$sslip_domain'
+with open('$STATE_FILE', 'w') as f: json.dump(s, f, indent=2)
+PYEOF
+
+    ok "Subscription: $sub_url"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -391,7 +539,6 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-    # Healthcheck скрипт
     cat > /usr/local/bin/relay-healthcheck <<'CHKEOF'
 #!/usr/bin/env bash
 STATE="/etc/relay-state.json"
@@ -402,7 +549,6 @@ RPORT=$(jq -r .relay_port "$STATE")
 SVC=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
 PORT_OK=$(ss -tlnp 2>/dev/null | grep -q ":$RPORT " && echo "LISTEN" || echo "CLOSED")
 
-# upstream availability
 UPS=""
 COUNT=$(jq -r '.upstreams | length' "$STATE")
 for ((i=0; i<COUNT; i++)); do
@@ -418,13 +564,11 @@ done
 MSG="$TS  svc=$SVC  port=$RPORT($PORT_OK)  $UPS"
 echo "$MSG" | tee -a "$LOG" >/dev/null
 
-# auto-restart если сервис упал
 if [[ "$SVC" != "active" ]]; then
     echo "$TS  [WARN] xray-relay down — restarting" | tee -a "$LOG" >/dev/null
     systemctl restart xray-relay
 fi
 
-# rotate если > 10 МБ
 if [[ -f "$LOG" ]] && (( $(stat -c%s "$LOG" 2>/dev/null || echo 0) > 10485760 )); then
     mv "$LOG" "${LOG}.1"
     touch "$LOG"
@@ -496,25 +640,25 @@ setup_bbr() {
 # Финальный вывод
 # ══════════════════════════════════════════════════════════════════
 print_output() {
-    local relay_ip
+    local relay_ip pub_key short_id uuid sub_url
     relay_ip=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null \
              || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
              || echo "UNKNOWN")
-
-    local pub_key short_id uuid
-    pub_key=$(jq -r .public_key "$STATE_FILE")
-    short_id=$(jq -r .short_id  "$STATE_FILE")
-    uuid=$(jq -r .uuid          "$STATE_FILE")
-
-    local link="vless://${uuid}@${relay_ip}:${RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${RELAY_SNI}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${relay_ip}"
+    pub_key=$(jq -r .public_key      "$STATE_FILE")
+    short_id=$(jq -r .short_id       "$STATE_FILE")
+    uuid=$(jq -r .uuid               "$STATE_FILE")
+    sub_url=$(jq -r '.subscription_url // "не настроен"' "$STATE_FILE")
 
     echo ""
     hr
     echo -e "${CB}${CG}  Relay готов!  IP: $relay_ip${NC}"
     hr
 
-    echo -e "\n${CB}VLESS-ссылка для клиента (импорт в v2rayNG / Hiddify / Marzban):${NC}"
-    echo -e "${CY}$link${NC}"
+    echo -e "\n${CB}Subscription URL для HAPP / incy (добавить как подписку):${NC}"
+    echo -e "${CY}$sub_url${NC}"
+
+    echo -e "\n${CB}VLESS-ссылка (запасной вариант — без fragment):${NC}"
+    echo -e "${CY}vless://${uuid}@${relay_ip}:${RELAY_PORT}?encryption=none&security=reality&sni=${RELAY_SNI}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${relay_ip}${NC}"
 
     echo -e "\n${CB}Upstream:${NC}"
     for ((i=1; i<=UPCOUNT; i++)); do
@@ -524,49 +668,55 @@ print_output() {
     done
     if (( UPCOUNT > 1 )); then echo "  Failover: leastPing (probe 30s)"; fi
 
+    echo -e "\n${CB}Yandex Cloud Security Group — открой входящие порты:${NC}"
+    echo "  TCP $RELAY_PORT  — клиентские подключения"
+    echo "  TCP $SUB_PORT   — скачивание subscription"
+    echo "  TCP 80          — certbot LE renewal"
+
     echo -e "\n${CB}Команды:${NC}"
-    echo "  bash $0 --status                — состояние relay (сервис/порт/upstream'ы)"
-    echo "  systemctl status xray-relay     — статус сервиса"
-    echo "  journalctl -u xray-relay -f     — live логи xray"
-    echo "  tail -f /var/log/xray/healthcheck.log — лог healthcheck"
-    echo "  cat $STATE_FILE | jq .          — параметры"
-    echo "  bash $0 --uninstall             — снести всё"
+    echo "  bash $0 --status          — состояние relay"
+    echo "  journalctl -u xray-relay -f  — live логи"
+    echo "  bash $0 --uninstall       — снести всё"
     hr
     echo ""
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Uninstall — для быстрого перебора VM
+# Uninstall
 # ══════════════════════════════════════════════════════════════════
 uninstall() {
     info "Удаляю xray-relay"
-    systemctl disable --now xray-relay 2>/dev/null || true
+    systemctl disable --now xray-relay          2>/dev/null || true
     systemctl disable --now relay-healthcheck.timer 2>/dev/null || true
+    systemctl disable --now relay-sub           2>/dev/null || true
     rm -f /etc/systemd/system/xray-relay.service
     rm -f /etc/systemd/system/relay-healthcheck.service
     rm -f /etc/systemd/system/relay-healthcheck.timer
+    rm -f /etc/systemd/system/relay-sub.service
     rm -f /usr/local/bin/relay-healthcheck
     systemctl daemon-reload
-    rm -rf "$XRAY_CONF_DIR" "$XRAY_LOG_DIR" "$STATE_FILE"
+    rm -rf "$XRAY_CONF_DIR" "$XRAY_LOG_DIR" "$STATE_FILE" "$SUB_DIR"
     iptables -D INPUT -p tcp --dport "${RELAY_PORT:-443}" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT 2>/dev/null || true
     ok "Готово. xray бинарь $XRAY_BIN не трогал — снеси вручную если надо."
     exit 0
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Status — on-demand проверка без модификации системы
+# Status
 # ══════════════════════════════════════════════════════════════════
 status() {
     local STATE="/etc/relay-state.json"
     [[ ! -f "$STATE" ]] && die "State не найден ($STATE) — relay не установлен"
 
-    local rport rsni uuid pub_key short_id installed
-    rport=$(jq -r .relay_port   "$STATE")
-    rsni=$(jq -r  .relay_sni    "$STATE")
-    uuid=$(jq -r  .uuid         "$STATE")
-    pub_key=$(jq -r .public_key "$STATE")
-    short_id=$(jq -r .short_id  "$STATE")
-    installed=$(jq -r .installed_at "$STATE")
+    local rport rsni uuid pub_key short_id installed sub_url
+    rport=$(jq -r .relay_port        "$STATE")
+    rsni=$(jq -r  .relay_sni         "$STATE")
+    uuid=$(jq -r  .uuid              "$STATE")
+    pub_key=$(jq -r .public_key      "$STATE")
+    short_id=$(jq -r .short_id       "$STATE")
+    installed=$(jq -r .installed_at  "$STATE")
+    sub_url=$(jq -r '.subscription_url // "не настроен"' "$STATE")
 
     local svc port_state ext_ip
     svc=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
@@ -576,11 +726,9 @@ status() {
     hr
     echo -e "${CB}  RELAY STATUS  ${NC}"
     hr
-    [[ "$svc" == "active" ]] && ok "Сервис xray-relay: active" || warn "Сервис xray-relay: $svc"
+    [[ "$svc" == "active" ]] && ok "xray-relay: active" || warn "xray-relay: $svc"
     [[ "$port_state" == "LISTEN" ]] && ok "Порт $rport: LISTEN" || warn "Порт $rport: $port_state"
-    info "Внешний IP: $ext_ip"
-    info "SNI: $rsni"
-    info "Установлен: $installed"
+    info "IP: $ext_ip  |  SNI: $rsni  |  Установлен: $installed"
 
     echo ""
     echo -e "${CB}Upstreams:${NC}"
@@ -606,8 +754,11 @@ status() {
     fi
 
     echo ""
-    echo -e "${CB}VLESS-ссылка для клиента:${NC}"
-    echo -e "${CY}vless://${uuid}@${ext_ip}:${rport}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${rsni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${ext_ip}${NC}"
+    echo -e "${CB}Subscription URL:${NC}"
+    echo -e "${CY}$sub_url${NC}"
+    echo ""
+    echo -e "${CB}VLESS-ссылка (без fragment):${NC}"
+    echo -e "${CY}vless://${uuid}@${ext_ip}:${rport}?encryption=none&security=reality&sni=${rsni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#Relay-RU-${ext_ip}${NC}"
     hr
     exit 0
 }
@@ -616,13 +767,10 @@ status() {
 # Main
 # ══════════════════════════════════════════════════════════════════
 main() {
-    echo -e "\n${CB}${CC}  setup-relay.sh v2${NC}\n"
+    echo -e "\n${CB}${CC}  setup-relay.sh v3 (Reality+Fragment)${NC}\n"
 
-    # --status работает без root (только чтение)
     [[ "${1:-}" == "--status"    || "${1:-}" == "-s" ]] && status
-
     [[ $EUID -ne 0 ]] && die "Нужен root"
-
     [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]] && uninstall
 
     [[ $# -eq 0 ]] && cat <<USAGE && exit 1
@@ -634,16 +782,16 @@ main() {
   sudo bash $0 --uninstall                         # снести relay
 
 ENV (необязательно):
-  RELAY_PORT=443           — порт куда подключается клиент
-  RELAY_SNI=cloudflare.com — SNI для Reality на relay
-  RELAY_UUID=<uuid>        — фиксированный UUID клиента
-  CONN_LIMIT=64            — лимит соединений с одного IP
-  LOG_LEVEL=warning        — xray loglevel (warning/info/debug)
+  RELAY_PORT=443                — порт куда подключается клиент
+  RELAY_SNI=dzen.ru             — SNI для Reality (RU домен для обхода МТС)
+  RELAY_UUID=<uuid>             — фиксированный UUID клиента
+  CONN_LIMIT=2048               — лимит соединений с одного IP (CGNAT)
+  CERTBOT_EMAIL=your@email.com  — email для Let's Encrypt
+  LOG_LEVEL=warning             — xray loglevel
 USAGE
 
     RELAY_PORT="${RELAY_PORT:-443}"
     RELAY_SNI="${RELAY_SNI:-${SNI_POOL[$((RANDOM % ${#SNI_POOL[@]}))]}}"
-    # 2048 — учитываем CGNAT мобильных операторов РФ (один внешний IP на тысячи абонентов)
     CONN_LIMIT="${CONN_LIMIT:-2048}"
 
     info "OS: $(lsb_release -ds 2>/dev/null || uname -rs)"
@@ -671,7 +819,7 @@ USAGE
         if (echo >/dev/tcp/"$h"/"$p") 2>/dev/null; then
             ok "Upstream #$i ${n:-} → $h:$p — доступен"
         else
-            warn "Upstream #$i ${n:-} → $h:$p — недоступен (relay поднимется, но трафик не пройдёт)"
+            warn "Upstream #$i ${n:-} → $h:$p — недоступен"
         fi
         i=$((i + 1))
     done
@@ -681,6 +829,7 @@ USAGE
     setup_systemd
     setup_firewall
     setup_bbr
+    setup_subscription
     print_output
 }
 
