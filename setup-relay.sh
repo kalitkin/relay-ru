@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-relay.sh v3 — RU-relay с VLESS+Reality+Fragment (обход МТС DPI)
+# setup-relay.sh v3.1 — RU-relay с VLESS+Reality+Fragment (обход МТС DPI)
 #
 # Схема:
 #   Клиент (HAPP/incy + fragment) → VLESS+Reality → Relay (RU IP) → VLESS+Reality → VPS:8443 → инет
@@ -12,6 +12,7 @@
 #   sudo bash setup-relay.sh "vless://...NL" "vless://...FI"        # с failover
 #   sudo bash setup-relay.sh "https://.../sub/..."                   # Marzban subscription URL
 #   sudo bash setup-relay.sh --status
+#   sudo bash setup-relay.sh --update "https://.../sub/..."          # обновить upstream UUID/хосты (inbound не трогает)
 #   sudo bash setup-relay.sh --uninstall
 
 set -euo pipefail
@@ -300,7 +301,7 @@ JSON
     "error":  "${XRAY_LOG_DIR}/error.log"
   },
   "policy": {
-    "levels": {"0": {"handshake": 4, "connIdle": 120, "uplinkOnly": 2, "downlinkOnly": 5}}
+    "levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}}
   },
   "inbounds": [{
     "tag": "CLIENT_IN",
@@ -322,8 +323,7 @@ JSON
         "privateKey": "$priv_key",
         "shortIds": ["$short_id", ""]
       }
-    },
-    "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    }
   }],
   "outbounds": [
 $outs    {"protocol": "freedom",   "tag": "DIRECT"},
@@ -360,6 +360,149 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════════════
+# Обновление upstream (--update): UUID + хосты без смены inbound
+# Нужно когда Marzban ротирует UUID у пользователя
+# ══════════════════════════════════════════════════════════════════
+update_upstream() {
+    local sub_arg="${1:-}"
+    [[ $EUID -ne 0 ]] && die "Нужен root"
+    [[ ! -f "$XRAY_CONF" ]] && die "Relay не установлен (нет $XRAY_CONF)"
+
+    if [[ -z "$sub_arg" ]]; then
+        [[ -f "$STATE_FILE" ]] \
+            && sub_arg=$(python3 -c "import json; s=json.load(open('$STATE_FILE')); print(s.get('sub_url',''))" 2>/dev/null) \
+            || true
+        [[ -z "$sub_arg" ]] && die "Укажи URL подписки: --update \"https://...\""
+    fi
+
+    info "Обновляю upstreams из: $sub_arg"
+    EXPANDED_LINKS=()
+    expand_arg "$sub_arg"
+
+    UPCOUNT=${#EXPANDED_LINKS[@]}
+    (( UPCOUNT == 0 )) && die "Нет VLESS-ссылок"
+
+    local i=1
+    for link in "${EXPANDED_LINKS[@]}"; do
+        parse_vless "$i" "$link"
+        i=$((i + 1))
+    done
+
+    local outs="" sel=""
+    for ((i=1; i<=UPCOUNT; i++)); do
+        outs+="$(build_outbound "$i"),"$'\n'
+        sel+="\"UP_$i\","
+    done
+    sel="${sel%,}"
+
+    python3 - <<PYEOF
+import json
+
+with open('$XRAY_CONF') as f:
+    c = json.load(f)
+
+# Удалить старые vless outbounds, оставить freedom/blackhole
+c['outbounds'] = [o for o in c['outbounds'] if o.get('protocol') != 'vless']
+
+# Вставить новые перед DIRECT
+ins = next((i for i,o in enumerate(c['outbounds']) if o.get('tag') == 'DIRECT'), 0)
+PYEOF
+
+    python3 << PYEOF
+import json, subprocess
+
+with open('$XRAY_CONF') as f:
+    c = json.load(f)
+
+c['outbounds'] = [o for o in c['outbounds'] if o.get('protocol') != 'vless']
+ins = next((i for i,o in enumerate(c['outbounds']) if o.get('tag') == 'DIRECT'), 0)
+
+new_obs = []
+PYEOF
+
+    # Строим новые outbounds через build_outbound и вставляем через python
+    local outs_json="["
+    for ((i=1; i<=UPCOUNT; i++)); do
+        outs_json+="$(build_outbound "$i"),"
+    done
+    outs_json="${outs_json%,}]"
+
+    python3 - "$outs_json" "$sel" "$UPCOUNT" <<'PYEOF'
+import json, sys
+
+outs_json = sys.argv[1]
+sel_str   = sys.argv[2]   # "UP_1","UP_2","UP_3"
+upcount   = int(sys.argv[3])
+
+with open('/usr/local/etc/xray/config.json') as f:
+    c = json.load(f)
+
+c['outbounds'] = [o for o in c['outbounds'] if o.get('protocol') != 'vless']
+ins = next((i for i,o in enumerate(c['outbounds']) if o.get('tag') == 'DIRECT'), 0)
+
+new_obs = json.loads(outs_json)
+for ob in reversed(new_obs):
+    c['outbounds'].insert(ins, ob)
+
+tags = [f"UP_{i}" for i in range(1, upcount + 1)]
+if upcount > 1:
+    c['routing'] = {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {"type": "field", "ip": ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"], "outboundTag": "BLOCK"},
+            {"type": "field", "inboundTag": ["CLIENT_IN"], "balancerTag": "up"}
+        ],
+        "balancers": [
+            {"tag": "up", "selector": tags, "strategy": {"type": "leastPing"}}
+        ]
+    }
+    c['burstObservatory'] = {
+        "subjectSelector": tags,
+        "pingConfig": {
+            "destination": "https://1.1.1.1/cdn-cgi/trace",
+            "interval": "30s",
+            "timeout": "5s",
+            "samplingCount": 3
+        }
+    }
+else:
+    c['routing'] = {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {"type": "field", "ip": ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"], "outboundTag": "BLOCK"},
+            {"type": "field", "inboundTag": ["CLIENT_IN"], "outboundTag": "UP_1"}
+        ]
+    }
+    c.pop('burstObservatory', None)
+
+with open('/usr/local/etc/xray/config.json', 'w') as f:
+    json.dump(c, f, indent=2)
+
+print(f"Обновлено {upcount} upstream(s):")
+for ob in new_obs:
+    vnext = ob['settings']['vnext'][0]
+    print(f"  {ob['tag']}: {vnext['address']}:{vnext['port']}  uuid={vnext['users'][0]['id'][:8]}...")
+PYEOF
+
+    # Сохранить sub_url в state
+    python3 - "$sub_arg" <<'PYEOF'
+import json, sys
+sub_url = sys.argv[1]
+with open('/etc/relay-state.json') as f:
+    s = json.load(f)
+s['sub_url'] = sub_url
+with open('/etc/relay-state.json', 'w') as f:
+    json.dump(s, f, indent=2)
+PYEOF
+
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 | tail -3 || die "Конфиг не валиден после update"
+    systemctl restart xray-relay
+    sleep 1
+    systemctl is-active --quiet xray-relay && ok "xray-relay перезапущен" || die "xray-relay не стартует"
+    exit 0
+}
+
+# ══════════════════════════════════════════════════════════════════
 # HTTPS subscription endpoint с клиентским конфигом (fragment)
 # ══════════════════════════════════════════════════════════════════
 setup_subscription() {
@@ -369,9 +512,9 @@ setup_subscription() {
     relay_ip=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null \
              || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
              || die "Не удалось определить внешний IP")
-    pub_key=$(jq -r .public_key "$STATE_FILE")
-    short_id=$(jq -r .short_id  "$STATE_FILE")
-    uuid=$(jq -r .uuid          "$STATE_FILE")
+    pub_key=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['public_key'])")
+    short_id=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['short_id'])")
+    uuid=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['uuid'])")
 
     # LE cert через sslip.io (не нужна регистрация домена)
     local sslip_domain
@@ -380,7 +523,7 @@ setup_subscription() {
 
     if [[ ! -f "${cert_dir}/fullchain.pem" ]]; then
         info "Получаю LE cert для $sslip_domain"
-        apt-get install -y -qq certbot 2>/dev/null || warn "certbot не установился — subscription без HTTPS"
+        apt-get install -y -qq certbot 2>/dev/null || warn "certbot не установился"
         if command -v certbot &>/dev/null; then
             certbot certonly --standalone \
                 -d "$sslip_domain" \
@@ -454,19 +597,13 @@ setup_subscription() {
 }
 EOF
 
-    # Python HTTPS сервер
     cat > "$SUB_DIR/https_server.py" <<'PYEOF'
-import http.server, ssl, os
+import http.server, ssl, os, glob
 os.chdir('/var/www/sub')
 httpd = http.server.HTTPServer(('0.0.0.0', 8444), http.server.SimpleHTTPRequestHandler)
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-cert_dir = None
-import glob
-for d in glob.glob('/etc/letsencrypt/live/*/'):
-    if 'sslip.io' in d:
-        cert_dir = d.rstrip('/')
-        break
+cert_dir = next((d.rstrip('/') for d in glob.glob('/etc/letsencrypt/live/*/') if 'sslip.io' in d), None)
 if cert_dir:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert_dir + '/fullchain.pem', cert_dir + '/privkey.pem')
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -493,24 +630,25 @@ EOF
     sleep 1
 
     local proto="https"
-    if [[ ! -f "${cert_dir}/fullchain.pem" ]]; then proto="http"; fi
-
+    [[ ! -f "${cert_dir:-/nonexistent}/fullchain.pem" ]] && proto="http"
     local sub_url="${proto}://${sslip_domain}:${SUB_PORT}/relay.json"
 
-    # Сохранить в state
-    python3 - <<PYEOF 2>/dev/null || true
-import json
-with open('$STATE_FILE') as f: s = json.load(f)
-s['subscription_url'] = '$sub_url'
-s['sslip_domain'] = '$sslip_domain'
-with open('$STATE_FILE', 'w') as f: json.dump(s, f, indent=2)
+    python3 - "$sub_url" "$sslip_domain" <<'PYEOF'
+import json, sys
+sub_url, sslip = sys.argv[1], sys.argv[2]
+with open('/etc/relay-state.json') as f:
+    s = json.load(f)
+s['subscription_url'] = sub_url
+s['sslip_domain'] = sslip
+with open('/etc/relay-state.json', 'w') as f:
+    json.dump(s, f, indent=2)
 PYEOF
 
     ok "Subscription: $sub_url"
 }
 
 # ══════════════════════════════════════════════════════════════════
-# systemd
+# systemd + healthcheck
 # ══════════════════════════════════════════════════════════════════
 setup_systemd() {
     info "systemd"
@@ -545,15 +683,15 @@ STATE="/etc/relay-state.json"
 LOG="/var/log/xray/healthcheck.log"
 [[ ! -f "$STATE" ]] && { echo "State not found"; exit 1; }
 TS=$(date '+%Y-%m-%d %H:%M:%S')
-RPORT=$(jq -r .relay_port "$STATE")
+RPORT=$(python3 -c "import json; print(json.load(open('$STATE'))['relay_port'])")
 SVC=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
 PORT_OK=$(ss -tlnp 2>/dev/null | grep -q ":$RPORT " && echo "LISTEN" || echo "CLOSED")
 
 UPS=""
-COUNT=$(jq -r '.upstreams | length' "$STATE")
+COUNT=$(python3 -c "import json; print(len(json.load(open('$STATE'))['upstreams']))")
 for ((i=0; i<COUNT; i++)); do
-    H=$(jq -r ".upstreams[$i].host" "$STATE")
-    P=$(jq -r ".upstreams[$i].port" "$STATE")
+    H=$(python3 -c "import json; print(json.load(open('$STATE'))['upstreams'][$i]['host'])")
+    P=$(python3 -c "import json; print(json.load(open('$STATE'))['upstreams'][$i]['port'])")
     if (echo >/dev/tcp/"$H"/"$P") 2>/dev/null; then
         UPS+="$H:$P=UP "
     else
@@ -626,14 +764,55 @@ setup_firewall() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-# BBR
+# BBR + TCP tuning
 # ══════════════════════════════════════════════════════════════════
-setup_bbr() {
-    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && { ok "BBR ON"; return; }
-    grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null \
-        || printf '\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> /etc/sysctl.conf
+setup_kernel() {
+    grep -q 'rmem_max=67108864' /etc/sysctl.conf 2>/dev/null || cat >> /etc/sysctl.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=6
+net.netfilter.nf_conntrack_max=262144
+EOF
     sysctl -p > /dev/null 2>&1 || true
-    ok "BBR включён"
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && ok "BBR ON" || warn "BBR: ядро не поддерживает"
+    ok "TCP tuning применён (буферы 64MB, keepalive 60s)"
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Swap + Logrotate
+# ══════════════════════════════════════════════════════════════════
+setup_extras() {
+    # Swap 512MB (защита от OOM)
+    if ! swapon --show | grep -q swap 2>/dev/null; then
+        fallocate -l 512M /swapfile 2>/dev/null && \
+        chmod 600 /swapfile && mkswap /swapfile > /dev/null && swapon /swapfile && \
+        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        ok "Swap 512MB создан"
+    else
+        ok "Swap уже есть"
+    fi
+
+    # Logrotate
+    cat > /etc/logrotate.d/xray <<'EOF'
+/var/log/xray/*.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    ok "Logrotate: daily, 7 дней"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -644,10 +823,10 @@ print_output() {
     relay_ip=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null \
              || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
              || echo "UNKNOWN")
-    pub_key=$(jq -r .public_key      "$STATE_FILE")
-    short_id=$(jq -r .short_id       "$STATE_FILE")
-    uuid=$(jq -r .uuid               "$STATE_FILE")
-    sub_url=$(jq -r '.subscription_url // "не настроен"' "$STATE_FILE")
+    pub_key=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['public_key'])")
+    short_id=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['short_id'])")
+    uuid=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['uuid'])")
+    sub_url=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('subscription_url','не настроен'))")
 
     echo ""
     hr
@@ -668,15 +847,16 @@ print_output() {
     done
     if (( UPCOUNT > 1 )); then echo "  Failover: leastPing (probe 30s)"; fi
 
-    echo -e "\n${CB}Yandex Cloud Security Group — открой входящие порты:${NC}"
-    echo "  TCP $RELAY_PORT  — клиентские подключения"
+    echo -e "\n${CB}Yandex Cloud Security Group — открой входящие порты (CIDR 0.0.0.0/0):${NC}"
+    echo "  TCP $RELAY_PORT  — клиентские подключения (Reality)"
     echo "  TCP $SUB_PORT   — скачивание subscription"
     echo "  TCP 80          — certbot LE renewal"
 
     echo -e "\n${CB}Команды:${NC}"
-    echo "  bash $0 --status          — состояние relay"
-    echo "  journalctl -u xray-relay -f  — live логи"
-    echo "  bash $0 --uninstall       — снести всё"
+    echo "  sudo bash $0 --status                       — состояние relay"
+    echo "  sudo bash $0 --update \"https://sub-url\"     — обновить upstream UUID (после ротации Marzban)"
+    echo "  journalctl -u xray-relay -f                 — live логи"
+    echo "  sudo bash $0 --uninstall                    — снести всё"
     hr
     echo ""
 }
@@ -686,9 +866,9 @@ print_output() {
 # ══════════════════════════════════════════════════════════════════
 uninstall() {
     info "Удаляю xray-relay"
-    systemctl disable --now xray-relay          2>/dev/null || true
+    systemctl disable --now xray-relay              2>/dev/null || true
     systemctl disable --now relay-healthcheck.timer 2>/dev/null || true
-    systemctl disable --now relay-sub           2>/dev/null || true
+    systemctl disable --now relay-sub               2>/dev/null || true
     rm -f /etc/systemd/system/xray-relay.service
     rm -f /etc/systemd/system/relay-healthcheck.service
     rm -f /etc/systemd/system/relay-healthcheck.timer
@@ -696,8 +876,9 @@ uninstall() {
     rm -f /usr/local/bin/relay-healthcheck
     systemctl daemon-reload
     rm -rf "$XRAY_CONF_DIR" "$XRAY_LOG_DIR" "$STATE_FILE" "$SUB_DIR"
+    rm -f /etc/logrotate.d/xray
     iptables -D INPUT -p tcp --dport "${RELAY_PORT:-443}" -j ACCEPT 2>/dev/null || true
-    iptables -D INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT            2>/dev/null || true
     ok "Готово. xray бинарь $XRAY_BIN не трогал — снеси вручную если надо."
     exit 0
 }
@@ -706,17 +887,16 @@ uninstall() {
 # Status
 # ══════════════════════════════════════════════════════════════════
 status() {
-    local STATE="/etc/relay-state.json"
-    [[ ! -f "$STATE" ]] && die "State не найден ($STATE) — relay не установлен"
+    [[ ! -f "$STATE_FILE" ]] && die "State не найден ($STATE_FILE) — relay не установлен"
 
     local rport rsni uuid pub_key short_id installed sub_url
-    rport=$(jq -r .relay_port        "$STATE")
-    rsni=$(jq -r  .relay_sni         "$STATE")
-    uuid=$(jq -r  .uuid              "$STATE")
-    pub_key=$(jq -r .public_key      "$STATE")
-    short_id=$(jq -r .short_id       "$STATE")
-    installed=$(jq -r .installed_at  "$STATE")
-    sub_url=$(jq -r '.subscription_url // "не настроен"' "$STATE")
+    rport=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['relay_port'])")
+    rsni=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['relay_sni'])")
+    uuid=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['uuid'])")
+    pub_key=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['public_key'])")
+    short_id=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['short_id'])")
+    installed=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['installed_at'])")
+    sub_url=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('subscription_url','не настроен'))")
 
     local svc port_state ext_ip
     svc=$(systemctl is-active xray-relay 2>/dev/null || echo "inactive")
@@ -733,12 +913,12 @@ status() {
     echo ""
     echo -e "${CB}Upstreams:${NC}"
     local count
-    count=$(jq -r '.upstreams | length' "$STATE")
+    count=$(python3 -c "import json; print(len(json.load(open('$STATE_FILE'))['upstreams']))")
     for ((i=0; i<count; i++)); do
         local h p n
-        h=$(jq -r ".upstreams[$i].host" "$STATE")
-        p=$(jq -r ".upstreams[$i].port" "$STATE")
-        n=$(jq -r ".upstreams[$i].name" "$STATE")
+        h=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['upstreams'][$i]['host'])")
+        p=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['upstreams'][$i]['port'])")
+        n=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['upstreams'][$i]['name'])")
         if (echo >/dev/tcp/"$h"/"$p") 2>/dev/null; then
             ok "  #$((i+1)) $n  $h:$p"
         else
@@ -767,24 +947,27 @@ status() {
 # Main
 # ══════════════════════════════════════════════════════════════════
 main() {
-    echo -e "\n${CB}${CC}  setup-relay.sh v3 (Reality+Fragment)${NC}\n"
+    echo -e "\n${CB}${CC}  setup-relay.sh v3.1 (Reality+Fragment)${NC}\n"
 
     [[ "${1:-}" == "--status"    || "${1:-}" == "-s" ]] && status
+    [[ "${1:-}" == "--update"    || "${1:-}" == "-U" ]] && update_upstream "${2:-}"
+
     [[ $EUID -ne 0 ]] && die "Нужен root"
     [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]] && uninstall
 
     [[ $# -eq 0 ]] && cat <<USAGE && exit 1
 Использование:
-  sudo bash $0 "vless://..."                       # одна VLESS-ссылка
-  sudo bash $0 "vless://NL" "vless://FI"           # с failover
-  sudo bash $0 "https://.../sub/..."               # подписка (Marzban subscription URL)
-  sudo bash $0 --status                            # текущее состояние relay
-  sudo bash $0 --uninstall                         # снести relay
+  sudo bash $0 "vless://..."                             # одна VLESS-ссылка
+  sudo bash $0 "vless://NL" "vless://FI"                 # с failover
+  sudo bash $0 "https://.../sub/..."                     # Marzban subscription URL
+  sudo bash $0 --status                                  # текущее состояние
+  sudo bash $0 --update "https://.../sub/..."            # обновить upstream UUID
+  sudo bash $0 --uninstall                               # снести relay
 
 ENV (необязательно):
   RELAY_PORT=443                — порт куда подключается клиент
   RELAY_SNI=dzen.ru             — SNI для Reality (RU домен для обхода МТС)
-  RELAY_UUID=<uuid>             — фиксированный UUID клиента
+  RELAY_UUID=<uuid>             — фиксированный UUID клиента relay
   CONN_LIMIT=2048               — лимит соединений с одного IP (CGNAT)
   CERTBOT_EMAIL=your@email.com  — email для Let's Encrypt
   LOG_LEVEL=warning             — xray loglevel
@@ -797,7 +980,7 @@ USAGE
     info "OS: $(lsb_release -ds 2>/dev/null || uname -rs)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq 2>/dev/null || true
-    for pkg in curl jq iptables-persistent; do
+    for pkg in curl python3 iptables-persistent; do
         command -v "${pkg%%-*}" &>/dev/null && continue
         apt-get install -y -qq "$pkg" 2>/dev/null || warn "Не поставил $pkg"
     done
@@ -828,7 +1011,8 @@ USAGE
     generate_config
     setup_systemd
     setup_firewall
-    setup_bbr
+    setup_kernel
+    setup_extras
     setup_subscription
     print_output
 }
