@@ -283,8 +283,14 @@ EOF
     else
         cat > "$SUB_DIR/https_server.py" <<'PYEOF'
 import http.server, ssl, os, glob
+from socketserver import ThreadingMixIn
+
+class ThreadingHTTPServer(ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
 os.chdir('/var/www/sub')
-httpd = http.server.HTTPServer(('0.0.0.0', 8444), http.server.SimpleHTTPRequestHandler)
+httpd = ThreadingHTTPServer(('0.0.0.0', 8444), http.server.SimpleHTTPRequestHandler)
 cert_dir = next((d.rstrip('/') for d in glob.glob('/etc/letsencrypt/live/*/') if 'sslip.io' in d), None)
 if cert_dir:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
